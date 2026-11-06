@@ -1,0 +1,353 @@
+{
+  "descriptor": {
+    "actions": [],
+    "capabilities": [
+      "nonary.frame-limiter.windows",
+      "amaterasu.stream/join"
+    ],
+    "display_name": "Frame limiting",
+    "options": [
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Limit games launched during a streaming session. Start a new application session after saving.",
+        "id": "frame_limiter_enable",
+        "label": "Enable frame limiting",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "choice_labels": {
+          "auto": "Automatic",
+          "none": "Disabled",
+          "nvidia-control-panel": "NVIDIA driver",
+          "rtss": "RTSS"
+        },
+        "definition": {
+          "default": "auto",
+          "options": [
+            "auto",
+            "rtss",
+            "nvidia-control-panel",
+            "none"
+          ],
+          "type": "enum"
+        },
+        "help": "Automatic uses Proton for limiting and MangoHUD for the overlay when available.",
+        "id": "frame_limiter_provider",
+        "label": "Limiter",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": 0.0,
+          "maximum": 1000.0,
+          "minimum": 0.0,
+          "type": "decimal"
+        },
+        "help": "Use 0 to follow the client display or stream rate. For example: 60 or 59.94.",
+        "id": "frame_limiter_fps_limit",
+        "label": "Frame rate limit (FPS)",
+        "presentation": "slider",
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": "async",
+          "options": [
+            "async",
+            "front edge sync",
+            "back edge sync",
+            "nvidia reflex"
+          ],
+          "type": "enum"
+        },
+        "help": "Choose how RTSS paces frames.",
+        "id": "rtss_frame_limit_type",
+        "label": "RTSS timing",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": "",
+          "max_length": 1024,
+          "min_length": 0,
+          "type": "string"
+        },
+        "help": "Leave blank to find the installed RTSS copy automatically.",
+        "id": "rtss_install_path",
+        "label": "RTSS installation folder",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Allow automatic timing selection for virtual displays.",
+        "id": "rtss_allow_virtual_display_override",
+        "label": "Override RTSS timing for virtual displays",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "choice_labels": {
+          "disabled": "Disabled",
+          "enabled": "Enabled",
+          "legacy": "Legacy mode",
+          "vrr": "Variable refresh rate"
+        },
+        "definition": {
+          "default": "enabled",
+          "options": [
+            "enabled",
+            "vrr",
+            "legacy",
+            "disabled"
+          ],
+          "type": "enum"
+        },
+        "help": "Apply frame limiting automatically when supported frame generation is configured.",
+        "id": "frame_limiter_auto_virtual_framegen",
+        "label": "Automatic frame-generation limiting",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Turn off driver VSync while streaming, then restore it afterward.",
+        "id": "frame_limiter_disable_vsync",
+        "label": "Disable VSync",
+        "presentation": null,
+        "required_capabilities": []
+      }
+    ],
+    "provider": "amaterasu.frame-limiter",
+    "revision": 1,
+    "settings_validate": {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "settings_validate",
+      "schema_revision": 1,
+      "service": "nonary.frame-limiter/1"
+    }
+  },
+  "methods": [
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "settings_validate",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {},
+        "required": {
+          "values": "object"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "message": "string"
+        },
+        "required": {
+          "ok": "boolean",
+          "valid": "boolean"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    },
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "resource_plan",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {
+          "control_results": "array",
+          "dependency_inputs": "array",
+          "join_context": "object",
+          "resource_generation": "integer",
+          "source_video_mode": "object"
+        },
+        "required": {
+          "admission_id": "any",
+          "approved_plan": "any",
+          "consumer_requirements": "object",
+          "intent": "any",
+          "operation": "string",
+          "operation_id": "string",
+          "phase": "string",
+          "plan_revision": "any",
+          "provider_sequence": "integer",
+          "reason": "any",
+          "remaining_ms": "integer",
+          "requested_video": "any",
+          "settings": "object",
+          "settings_revision": "string",
+          "target": "object",
+          "transition_id": "string",
+          "version": "integer"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "candidate": "any",
+          "obligations": "array",
+          "outcomes": "array",
+          "outputs": "array",
+          "plan": "object",
+          "reason": "string",
+          "receipt_id": "string"
+        },
+        "required": {
+          "status": "string"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    },
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "lifecycle_callback",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {
+          "control_results": "array",
+          "dependency_inputs": "array",
+          "join_context": "object",
+          "resource_generation": "integer",
+          "source_video_mode": "object"
+        },
+        "required": {
+          "admission_id": "any",
+          "approved_plan": "any",
+          "consumer_requirements": "object",
+          "intent": "any",
+          "operation": "string",
+          "operation_id": "string",
+          "phase": "string",
+          "plan_revision": "any",
+          "provider_sequence": "integer",
+          "reason": "any",
+          "remaining_ms": "integer",
+          "requested_video": "any",
+          "settings": "object",
+          "settings_revision": "string",
+          "target": "object",
+          "transition_id": "string",
+          "version": "integer"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "candidate": "any",
+          "obligations": "array",
+          "outcomes": "array",
+          "outputs": "array",
+          "plan": "object",
+          "reason": "string",
+          "receipt_id": "string"
+        },
+        "required": {
+          "status": "string"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    },
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "lifecycle_status",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {},
+        "required": {
+          "operation_id": "string",
+          "provider_sequence": "integer",
+          "receipt_id": "string",
+          "transition_id": "string"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "candidate": "any",
+          "obligations": "array",
+          "outcomes": "array",
+          "outputs": "array",
+          "plan": "object",
+          "reason": "string",
+          "receipt_id": "string"
+        },
+        "required": {
+          "status": "string"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    }
+  ]
+}

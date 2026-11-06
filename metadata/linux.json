@@ -1,0 +1,366 @@
+{
+  "descriptor": {
+    "actions": [],
+    "capabilities": [
+      "amaterasu.launch-environment",
+      "amaterasu.stream/join"
+    ],
+    "display_name": "Frame limiting",
+    "options": [
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Limit games launched during a streaming session. Start a new application session after saving.",
+        "id": "frame_limiter_enable",
+        "label": "Enable frame limiting",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "choice_labels": {
+          "auto": "Automatic",
+          "mangohud": "MangoHUD",
+          "mangohud-proton": "Proton + MangoHUD",
+          "none": "Disabled",
+          "proton": "Proton"
+        },
+        "definition": {
+          "default": "auto",
+          "options": [
+            "auto",
+            "mangohud",
+            "proton",
+            "mangohud-proton",
+            "none"
+          ],
+          "type": "enum"
+        },
+        "help": "Automatic uses Proton for limiting and MangoHUD for the overlay when available.",
+        "id": "frame_limiter_provider",
+        "label": "Limiter",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": 0.0,
+          "maximum": 1000.0,
+          "minimum": 0.0,
+          "type": "decimal"
+        },
+        "help": "Use 0 to follow the client display or stream rate. For example: 60 or 59.94.",
+        "id": "frame_limiter_fps_limit",
+        "label": "Frame rate limit (FPS)",
+        "presentation": "slider",
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "choice_labels": {
+          "1": "Preset 1",
+          "2": "Preset 2",
+          "3": "Preset 3",
+          "4": "Preset 4",
+          "custom": "My MangoHUD configuration"
+        },
+        "definition": {
+          "default": "custom",
+          "options": [
+            "custom",
+            "1",
+            "2",
+            "3",
+            "4"
+          ],
+          "type": "enum"
+        },
+        "help": "Use your existing MangoHUD configuration, or choose a built-in overlay preset.",
+        "id": "mangohud_preset",
+        "label": "MangoHUD appearance",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "Show the frame-time graph in the MangoHUD overlay.",
+        "id": "mangohud_always_show_graph",
+        "label": "Show frame-time graph",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host"
+        ],
+        "apply_policy": "next_stream",
+        "choice_labels": {
+          "early": "Smooth pacing (early)",
+          "late": "Lower latency (late)"
+        },
+        "definition": {
+          "default": "late",
+          "options": [
+            "early",
+            "late"
+          ],
+          "type": "enum"
+        },
+        "help": "Early favors smooth pacing; late favors lower input latency. Used when MangoHUD limits the game.",
+        "id": "mangohud_limiter_method",
+        "label": "MangoHUD timing",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "choice_labels": {
+          "disabled": "Disabled",
+          "enabled": "Enabled",
+          "legacy": "Legacy mode",
+          "vrr": "Variable refresh rate"
+        },
+        "definition": {
+          "default": "enabled",
+          "options": [
+            "enabled",
+            "vrr",
+            "legacy",
+            "disabled"
+          ],
+          "type": "enum"
+        },
+        "help": "Apply frame limiting automatically when supported frame generation is configured.",
+        "id": "frame_limiter_auto_virtual_framegen",
+        "label": "Automatic frame-generation limiting",
+        "presentation": null,
+        "required_capabilities": []
+      },
+      {
+        "allowed_scopes": [
+          "host",
+          "application",
+          "paired_client",
+          "session"
+        ],
+        "apply_policy": "next_stream",
+        "definition": {
+          "default": false,
+          "type": "boolean"
+        },
+        "help": "MangoHUD and Proton cannot change VSync. Leave this off and configure VSync in the game.",
+        "id": "frame_limiter_disable_vsync",
+        "label": "Disable VSync",
+        "presentation": null,
+        "required_capabilities": []
+      }
+    ],
+    "provider": "amaterasu.frame-limiter",
+    "revision": 1,
+    "settings_validate": {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "settings_validate",
+      "schema_revision": 1,
+      "service": "nonary.frame-limiter/1"
+    }
+  },
+  "methods": [
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "settings_validate",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {},
+        "required": {
+          "values": "object"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "message": "string"
+        },
+        "required": {
+          "ok": "boolean",
+          "valid": "boolean"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    },
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "resource_plan",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {
+          "control_results": "array",
+          "dependency_inputs": "array",
+          "join_context": "object",
+          "resource_generation": "integer",
+          "source_video_mode": "object"
+        },
+        "required": {
+          "admission_id": "any",
+          "approved_plan": "any",
+          "consumer_requirements": "object",
+          "intent": "any",
+          "operation": "string",
+          "operation_id": "string",
+          "phase": "string",
+          "plan_revision": "any",
+          "provider_sequence": "integer",
+          "reason": "any",
+          "remaining_ms": "integer",
+          "requested_video": "any",
+          "settings": "object",
+          "settings_revision": "string",
+          "target": "object",
+          "transition_id": "string",
+          "version": "integer"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "candidate": "any",
+          "obligations": "array",
+          "outcomes": "array",
+          "outputs": "array",
+          "plan": "object",
+          "reason": "string",
+          "receipt_id": "string"
+        },
+        "required": {
+          "status": "string"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    },
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "lifecycle_callback",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {
+          "control_results": "array",
+          "dependency_inputs": "array",
+          "join_context": "object",
+          "resource_generation": "integer",
+          "source_video_mode": "object"
+        },
+        "required": {
+          "admission_id": "any",
+          "approved_plan": "any",
+          "consumer_requirements": "object",
+          "intent": "any",
+          "operation": "string",
+          "operation_id": "string",
+          "phase": "string",
+          "plan_revision": "any",
+          "provider_sequence": "integer",
+          "reason": "any",
+          "remaining_ms": "integer",
+          "requested_video": "any",
+          "settings": "object",
+          "settings_revision": "string",
+          "target": "object",
+          "transition_id": "string",
+          "version": "integer"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "candidate": "any",
+          "obligations": "array",
+          "outcomes": "array",
+          "outputs": "array",
+          "plan": "object",
+          "reason": "string",
+          "receipt_id": "string"
+        },
+        "required": {
+          "status": "string"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    },
+    {
+      "interface_major": 1,
+      "interface_minor": 0,
+      "method": "lifecycle_status",
+      "privilege": "user",
+      "request": {
+        "allow_extra": false,
+        "optional": {},
+        "required": {
+          "operation_id": "string",
+          "provider_sequence": "integer",
+          "receipt_id": "string",
+          "transition_id": "string"
+        }
+      },
+      "response": {
+        "allow_extra": false,
+        "optional": {
+          "candidate": "any",
+          "obligations": "array",
+          "outcomes": "array",
+          "outputs": "array",
+          "plan": "object",
+          "reason": "string",
+          "receipt_id": "string"
+        },
+        "required": {
+          "status": "string"
+        }
+      },
+      "service": "nonary.frame-limiter/1"
+    }
+  ]
+}

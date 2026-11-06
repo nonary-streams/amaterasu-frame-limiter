@@ -1,0 +1,5 @@
+/target
+/ui/node_modules
+/ui/build
+__pycache__/
+*.pyc

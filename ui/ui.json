@@ -1,0 +1,5 @@
+{
+  "placements": ["settings", "application"],
+  "settings_provider": "amaterasu.frame-limiter",
+  "methods": []
+}
