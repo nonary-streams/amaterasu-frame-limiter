@@ -197,6 +197,7 @@ pub fn descriptor(platform: Platform) -> ExtensionDescriptor {
     ExtensionDescriptor {
         provider: PROVIDER.into(),
         display_name: Some("Frame limiting".into()),
+        default_expanded: false,
         revision: 1,
         options,
         actions: vec![],
