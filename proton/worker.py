@@ -91,6 +91,7 @@ def _handle(line, store, helper_source, completed):
             tools, diagnostics = discovery.discover(request["roots"])
             complete(True, tools=tools, diagnostics=diagnostics)
         elif operation == "close" and set(request) == {"id", "operation"}:
+            store.close()
             complete(True, state="closed")
             return False
         else:

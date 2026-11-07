@@ -1,9 +1,13 @@
 //! Plugin-private process boundary for Windows effects. Parent-side callbacks
 //! remain asynchronous; only the child loads RTSS or NVIDIA's native APIs.
+#[cfg(windows)]
 mod child;
+#[cfg(windows)]
 mod launch;
+mod shutdown;
 #[cfg(test)]
 mod tests;
+#[cfg(windows)]
 pub(crate) use child::stage as child_stage;
 
 use crate::{native_worker_process::Process, windows_policy::Policy};
@@ -74,6 +78,7 @@ enum Reply {
     Fatal {
         reason: String,
     },
+    Stopped,
 }
 
 struct Job {
@@ -83,6 +88,12 @@ struct Job {
     last_progress: Instant,
     stage: String,
     retried: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Retirement {
+    job: u64,
+    deadline: Instant,
 }
 
 pub(crate) struct Worker {
@@ -100,6 +111,12 @@ pub(crate) struct Worker {
     queue: VecDeque<u64>,
     completed: VecDeque<u64>,
     active: Option<u64>,
+    shutdown_deadline: Option<Instant>,
+    shutdown_started: bool,
+    shutdown_restored: bool,
+    shutdown_forced: bool,
+    shutdown_complete: bool,
+    retiring: Option<Retirement>,
 }
 
 impl Worker {
@@ -124,12 +141,21 @@ impl Worker {
             queue: VecDeque::new(),
             completed: VecDeque::new(),
             active: None,
+            shutdown_deadline: None,
+            shutdown_started: false,
+            shutdown_restored: false,
+            shutdown_forced: false,
+            shutdown_complete: false,
+            retiring: None,
         }
     }
 
     /// Starts initialization on demand. A terminal initialization error must be
     /// returned to the caller, not turn into an endless context-read wait.
     pub(crate) fn initializing(&mut self) -> bool {
+        if self.shutdown_started {
+            return false;
+        }
         self.wanted = true;
         self.snapshot.is_none() && self.failure.is_none()
     }
@@ -250,6 +276,11 @@ impl Worker {
         payload: Value,
         remaining_ms: u64,
     ) -> Result<u64, &'static str> {
+        if self.shutdown_deadline.is_some()
+            && payload.get("action").and_then(Value::as_str) == Some("apply")
+        {
+            return Err("host_stopping");
+        }
         if let Some(reason) = self.failure {
             return Err(reason);
         }
@@ -263,6 +294,9 @@ impl Worker {
     }
 
     fn submit(&mut self, operation: Operation, remaining_ms: u64) -> Result<u64, &'static str> {
+        if self.shutdown_started {
+            return Err("host_stopping");
+        }
         if serde_json::to_vec(&operation)
             .map_err(|_| "native_worker_invalid_request")?
             .len()
@@ -306,7 +340,21 @@ impl Worker {
     }
 
     pub(crate) fn advance(&mut self) {
-        if self.failure.is_some() || !self.wanted {
+        if self.shutdown_started {
+            let _ = self.quiesce();
+            return;
+        }
+        if self.failure.is_some() {
+            if self
+                .process
+                .as_mut()
+                .is_some_and(|process| matches!(process.poll_exit(), Ok(Some(_))))
+            {
+                self.process.take();
+            }
+            return;
+        }
+        if !self.wanted {
             return;
         }
         if let Err(reason) = self.advance_inner() {
@@ -316,6 +364,20 @@ impl Worker {
 
     fn advance_inner(&mut self) -> Result<(), &'static str> {
         let now = Instant::now();
+        if let Some(retirement) = self.retiring {
+            if self.process.as_mut().unwrap().poll_exit()?.is_none() {
+                if now >= retirement.deadline {
+                    return Err("native_worker_tree_stop_unconfirmed");
+                }
+                return Ok(());
+            }
+            self.process.take();
+            self.retiring = None;
+            if self.retry_stalled_rtss(retirement.job, now) {
+                return Ok(());
+            }
+            return Err("native_worker_effect_unconfirmed");
+        }
         if self.process.is_none() {
             #[cfg(test)]
             let command = if let Some((program, mode)) = &self.fixture {
@@ -323,10 +385,10 @@ impl Worker {
                 command.env("AMATERASU_NATIVE_WORKER_FIXTURE_MODE", mode);
                 command
             } else {
-                launch::command()?
+                native_command()?
             };
             #[cfg(not(test))]
-            let command = launch::command()?;
+            let command = native_command()?;
             let process = Process::spawn(command)?;
             process.submit(
                 &serde_json::to_value(&self.config).map_err(|_| "native_worker_invalid_config")?,
@@ -391,11 +453,12 @@ impl Worker {
             if now >= job.deadline || now.duration_since(job.last_progress) >= stage_limit {
                 // Require the complete owned tree to exit before journal-based
                 // fallback. Waiting only for the worker could leave RTSS alive.
-                self.process.take().unwrap().retire()?;
-                if self.retry_stalled_rtss(id, now) {
-                    return Ok(());
-                }
-                return Err("native_worker_effect_unconfirmed");
+                self.process.as_mut().unwrap().force_stop()?;
+                self.retiring = Some(Retirement {
+                    job: id,
+                    deadline: job.deadline.min(now + Duration::from_millis(500)),
+                });
+                return Ok(());
             }
         }
         if !self.process.as_mut().unwrap().is_running()? {
@@ -472,7 +535,9 @@ impl Worker {
         }
     }
     fn fail(&mut self, reason: &'static str) {
-        self.process = None;
+        if let Some(process) = &mut self.process {
+            let _ = process.force_stop();
+        }
         self.snapshot = None;
         self.starting = None;
         self.failure = Some(reason);
@@ -487,6 +552,17 @@ impl Worker {
         }
         self.active = None;
         self.queue.clear();
+    }
+}
+
+fn native_command() -> Result<std::process::Command, &'static str> {
+    #[cfg(windows)]
+    {
+        launch::command()
+    }
+    #[cfg(not(windows))]
+    {
+        Err("native_worker_requires_windows")
     }
 }
 

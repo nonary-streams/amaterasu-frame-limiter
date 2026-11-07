@@ -75,35 +75,43 @@ fn run() -> Result<(), &'static str> {
     write(&Reply::Ready {
         snapshot: snapshot(&backend)?,
     })?;
-    while let Some(call) = read::<Call>(&mut input)? {
-        if call.id == 0 {
-            return Err("native_worker_call_invalid");
-        }
-        OPERATION.store(call.id, Ordering::Relaxed);
-        let value = match call.operation {
-            Operation::Lifecycle { request, policy } => {
-                serde_json::to_value(backend.begin(&request, policy))
-                    .map_err(|_| "native_worker_output_failed")?
+    let calls = (|| {
+        while let Some(call) = read::<Call>(&mut input)? {
+            if call.id == 0 {
+                return Err("native_worker_call_invalid");
             }
-            Operation::Legacy { caller, payload } => {
-                let restoring =
-                    payload.get("action").and_then(serde_json::Value::as_str) == Some("restore");
-                let result = handle_runtime_operation(&caller, payload, &mut leases.borrow_mut());
-                if restoring && let Err(error) = leases.borrow_mut().retire_provider_if_idle() {
-                    return Err(error.diagnostic());
+            OPERATION.store(call.id, Ordering::Relaxed);
+            let value = match call.operation {
+                Operation::Lifecycle { request, policy } => {
+                    serde_json::to_value(backend.begin(&request, policy))
+                        .map_err(|_| "native_worker_output_failed")?
                 }
-                result
-            }
-            Operation::Ping => serde_json::json!({"ok":true}),
-        };
-        write(&Reply::Result {
-            id: call.id,
-            value,
-            snapshot: snapshot(&backend)?,
-        })?;
-        OPERATION.store(0, Ordering::Relaxed);
-    }
-    Ok(())
+                Operation::Legacy { caller, payload } => {
+                    let restoring = payload.get("action").and_then(serde_json::Value::as_str)
+                        == Some("restore");
+                    let result =
+                        handle_runtime_operation(&caller, payload, &mut leases.borrow_mut());
+                    if restoring && let Err(error) = leases.borrow_mut().retire_provider_if_idle() {
+                        return Err(error.diagnostic());
+                    }
+                    result
+                }
+                Operation::Ping => serde_json::json!({"ok":true}),
+            };
+            write(&Reply::Result {
+                id: call.id,
+                value,
+                snapshot: snapshot(&backend)?,
+            })?;
+            OPERATION.store(0, Ordering::Relaxed);
+        }
+        Ok(())
+    })();
+    // EOF is the cooperative shutdown request. Restoration proof is emitted
+    // before process exit; killing this process can never substitute for it.
+    backend.shutdown()?;
+    calls?;
+    write(&Reply::Stopped)
 }
 
 /// Rundll32 calls this fixed WINAPI entrypoint with four arguments. The command
@@ -120,5 +128,8 @@ pub unsafe extern "system" fn amaterasu_frame_limiter_worker(
         let _ = write(&Reply::Fatal {
             reason: reason.into(),
         });
+        // SAFETY: this entrypoint runs only inside the private worker process.
+        // A cleanup error must not look like a successful rundll32 exit.
+        unsafe { windows_sys::Win32::System::Threading::ExitProcess(1) };
     }
 }

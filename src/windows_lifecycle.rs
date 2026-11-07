@@ -88,6 +88,38 @@ impl<P: FrameLimitProvider> Backend<P> {
 }
 
 impl<P: FrameLimitProvider, N: DriverSettings> Backend<P, N> {
+    /// Restore exact journal-owned effects, including compatibility RPC leases.
+    /// Native failures leave those records available to recovery/retry.
+    pub(crate) fn shutdown(&mut self) -> Result<(), &'static str> {
+        let mut failure = None;
+        if let Some((owner, target)) = self
+            .driver
+            .active_target()
+            .map(|(owner, target)| (owner.to_owned(), target.to_owned()))
+            && !matches!(
+                self.driver.restore(&owner, &target),
+                Outcome::Restored | Outcome::NotFound
+            )
+        {
+            failure = Some("native_worker_driver_cleanup_failed");
+        }
+        let records = self.leases.borrow().records();
+        for record in records {
+            if !matches!(
+                self.leases
+                    .borrow_mut()
+                    .restore(&record.owner, None, Some(&record.lease_id)),
+                RestoreOutcome::Restored(_) | RestoreOutcome::NotFound
+            ) {
+                failure.get_or_insert("native_worker_rtss_cleanup_failed");
+            }
+        }
+        if let Err(error) = self.leases.borrow_mut().retire_provider_if_idle() {
+            failure.get_or_insert(error.diagnostic());
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     #[cfg(windows)]
     pub(crate) fn snapshot(&self) -> Result<(u64, Vec<String>), &'static str> {
         let leases = self.leases.borrow();
@@ -628,6 +660,62 @@ mod tests {
         let response = backend.begin(&request, policy);
         api::validate_provider_response(&request, &response).unwrap();
         response
+    }
+
+    #[test]
+    fn native_shutdown_restores_owned_rtss_and_driver_and_retries_failed_cleanup() {
+        let rtss = memory();
+        let driver = nvcp::testing::Fake::new();
+        let before = driver.0.borrow().values.clone();
+        let leases = Rc::new(RefCell::new(LeaseManager::in_memory(FakeProvider(
+            rtss.clone(),
+        ))));
+        let mut backend = Backend::with_driver(leases.clone(), Manager::in_memory(driver.clone()));
+        let mut desired = policy(60);
+        desired.disable_vsync = true;
+        assert!(matches!(
+            run(&mut backend, None, 1, Some(desired)),
+            ProviderResponse::Prepared { .. }
+        ));
+        driver.0.borrow_mut().available = false;
+        assert_eq!(
+            backend.shutdown(),
+            Err("native_worker_driver_cleanup_failed")
+        );
+        assert!(
+            backend.driver.active_target().is_some(),
+            "failed native restore must keep exact ownership"
+        );
+        assert!(leases.borrow().records().is_empty());
+        assert_eq!(rtss.borrow().profile, ORIGINAL);
+        driver.0.borrow_mut().available = true;
+        backend.shutdown().unwrap();
+        assert!(backend.driver.active_target().is_none());
+        assert_eq!(driver.0.borrow().values, before);
+    }
+
+    #[test]
+    fn native_shutdown_preserves_external_changes_and_keeps_failed_ownership() {
+        let rtss = memory();
+        let leases = Rc::new(RefCell::new(LeaseManager::in_memory(FakeProvider(
+            rtss.clone(),
+        ))));
+        let mut backend = Backend::new(leases.clone());
+        assert!(matches!(
+            run(&mut backend, None, 1, Some(policy(60))),
+            ProviderResponse::Prepared { .. }
+        ));
+        // Compatibility and lifecycle leases share this exact-record drain;
+        // an unrecognized external change cannot be overwritten to look clean.
+        rtss.borrow_mut().profile.frame_limit = 77;
+        assert_eq!(backend.shutdown(), Err("native_worker_rtss_cleanup_failed"));
+        assert_eq!(rtss.borrow().profile.frame_limit, 77);
+        assert_eq!(leases.borrow().records().len(), 1);
+        assert_eq!(rtss.borrow().retired, 0);
+        rtss.borrow_mut().profile = policy(60).values;
+        backend.shutdown().unwrap();
+        assert_eq!(rtss.borrow().profile, ORIGINAL);
+        assert!(leases.borrow().records().is_empty());
     }
 
     #[test]

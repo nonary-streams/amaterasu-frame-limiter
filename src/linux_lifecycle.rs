@@ -57,6 +57,9 @@ pub(crate) struct Backend {
     recovery_deadline: Option<Instant>,
     records: BTreeMap<String, Record>,
     queue: VecDeque<String>,
+    shutdown: crate::shutdown::Shutdown,
+    shutdown_complete: bool,
+    retiring_worker: bool,
 }
 
 impl Backend {
@@ -141,7 +144,61 @@ impl Backend {
             recovery_deadline: None,
             records: BTreeMap::new(),
             queue: VecDeque::new(),
+            shutdown: Default::default(),
+            shutdown_complete: false,
+            retiring_worker: false,
         }
+    }
+
+    pub(crate) fn prepare_shutdown(&mut self, deadline: Instant) {
+        let deadline = self.shutdown.announce_until(deadline);
+        if let Some(worker) = &mut self.worker {
+            worker.prepare_shutdown(deadline);
+        }
+    }
+
+    pub(crate) fn quiesce(&mut self) -> Result<bool, &'static str> {
+        if self.shutdown_complete {
+            return Ok(true);
+        }
+        let deadline = self.shutdown.begin();
+        // A previous owner may still have a durable policy even when this
+        // instance has not started its replacement worker. Its strict startup
+        // check must retire that exact intent before shutdown can claim success.
+        if self.worker.is_none()
+            && (self.recovering
+                || !self.state.worker_policies.is_empty()
+                || self.state.pending_policies.is_some())
+        {
+            if Instant::now() >= deadline {
+                return Err("worker_shutdown_deadline_exceeded");
+            }
+            if !self.ensure_worker_ready()? {
+                return Ok(false);
+            }
+        }
+        if let Some(worker) = &mut self.worker {
+            worker.prepare_shutdown(deadline);
+            if !worker.quiesce()? {
+                return Ok(false);
+            }
+        }
+        if let Some(journal) = &mut self.journal {
+            // The worker's successful exit and owned-file absence are the
+            // proof. Persist it before replacing the live receipt ledger.
+            let mut retired = self.state.clone();
+            retired.retire_after_worker_restart()?;
+            journal.save(&retired)?;
+            self.state = retired;
+        }
+        self.worker = None;
+        self.queue.clear();
+        self.records.clear();
+        self.ready = false;
+        self.recovering = false;
+        self.retiring_worker = false;
+        self.shutdown_complete = true;
+        Ok(true)
     }
 
     fn initialize(&mut self) -> Result<(), &'static str> {
@@ -220,6 +277,9 @@ impl Backend {
                     receipt_id: receipt,
                 });
         }
+        if self.shutdown.started() {
+            return reject("provider_shutting_down");
+        }
         if self.recovering {
             return reject("worker_recovery_pending");
         }
@@ -297,6 +357,12 @@ impl Backend {
     }
 
     pub(crate) fn advance(&mut self) {
+        if self.shutdown.started() {
+            return;
+        }
+        if self.retiring_worker && !self.poll_failed_worker_retirement() {
+            return;
+        }
         if self.queue.is_empty()
             && self.ready
             && self
@@ -304,14 +370,15 @@ impl Backend {
                 .as_mut()
                 .is_some_and(|worker| worker.is_running() != Ok(true))
         {
-            self.worker = None;
+            self.retiring_worker = true;
             self.ready = false;
             self.failed = true;
             self.start_recovery();
+            return;
         }
         if self.recovering {
             if self.recover_worker().is_err() {
-                self.worker = None;
+                self.retiring_worker = self.worker.is_some();
                 self.ready = false;
                 self.failed = true;
                 self.recovering = false;
@@ -330,7 +397,7 @@ impl Backend {
             Err(reason) => {
                 // A worker failure can follow a successful filesystem write. Retire
                 // the worker to make its policy inert, and retain uncertainty.
-                self.worker = None;
+                self.retiring_worker = self.worker.is_some();
                 self.ready = false;
                 self.failed = true;
                 recover_worker = true;
@@ -346,7 +413,7 @@ impl Backend {
                 record.response.clone().expect("completed response"),
             );
             if let Err(reason) = self.checkpoint() {
-                self.worker = None;
+                self.retiring_worker = self.worker.is_some();
                 self.ready = false;
                 self.failed = true;
                 record.response = Some(ProviderResponse::RecoveryRequired {
@@ -369,6 +436,29 @@ impl Backend {
     fn start_recovery(&mut self) {
         self.recovering = true;
         self.recovery_deadline = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    fn poll_failed_worker_retirement(&mut self) -> bool {
+        let Some(worker) = &mut self.worker else {
+            self.retiring_worker = false;
+            return true;
+        };
+        let deadline = self
+            .recovery_deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(5));
+        worker.prepare_shutdown(deadline);
+        let retired = match worker.quiesce() {
+            Ok(retired) => retired,
+            // A failed worker may leave its exact policy file behind. Native
+            // process exit allows a replacement to validate and remove that
+            // intent; it is not itself policy retirement proof.
+            Err(_) => worker.is_running() == Ok(false),
+        };
+        if retired {
+            self.worker = None;
+            self.retiring_worker = false;
+        }
+        retired
     }
 
     fn recover_worker(&mut self) -> Result<(), &'static str> {
@@ -410,6 +500,12 @@ impl Backend {
                 &self.state.owner_id,
                 &expected,
             )?);
+            if let Some(deadline) = self.shutdown.deadline() {
+                self.worker
+                    .as_mut()
+                    .expect("started worker")
+                    .prepare_shutdown(deadline);
+            }
         }
         if !self.ready {
             let Some(reply) = self.worker.as_ref().expect("started worker").poll()? else {
@@ -1097,6 +1193,164 @@ mod tests {
             ProviderResponse::Cleanup { .. }
         ));
         assert!(fixture.policies().is_empty());
+    }
+
+    #[test]
+    fn shutdown_announcement_preserves_policy_and_serves_declared_consumers() {
+        let mut fixture = Fixture::new();
+        let first = policy(60000);
+        let prepare = request(&fixture.backend, 1, None, false, Some(&first));
+        assert!(matches!(
+            fixture.run(&prepare, Some(first.clone())),
+            ProviderResponse::Prepared { .. }
+        ));
+        let path = fixture.root.join("amaterasu/frame-limiter/active.json");
+        let policy_bytes = std::fs::read(&path).unwrap();
+        let state_path = fixture.root.join("amaterasu/frame-limiter/lifecycle.json");
+        let state_bytes = std::fs::read(&state_path).unwrap();
+        let expired = Instant::now() - Duration::from_millis(1);
+        fixture.backend.prepare_shutdown(expired);
+        fixture
+            .backend
+            .prepare_shutdown(Instant::now() + Duration::from_secs(300));
+        for _ in 0..3 {
+            fixture.backend.advance();
+        }
+        assert_eq!(fixture.backend.shutdown.deadline(), Some(expired));
+        assert!(!fixture.backend.shutdown.started());
+        assert_eq!(std::fs::read(&path).unwrap(), policy_bytes);
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+        assert_eq!(
+            fixture.backend.worker.as_mut().unwrap().is_running(),
+            Ok(true)
+        );
+
+        // Announcing host shutdown does not cut off a declared consumer's
+        // already-owned lifecycle operations before the dependency drain.
+        let stream = request(&fixture.backend, 2, Some("first"), false, Some(&first));
+        assert!(matches!(
+            fixture.run(&stream, Some(first)),
+            ProviderResponse::Prepared { .. }
+        ));
+        let release = request(&fixture.backend, 3, Some("first"), true, None);
+        assert!(matches!(
+            fixture.run(&release, None),
+            ProviderResponse::Cleanup { .. }
+        ));
+    }
+
+    #[test]
+    fn provider_quiesce_waits_for_eof_policy_retirement_before_replacing_receipts() {
+        let mut fixture = Fixture::new();
+        let first = policy(60000);
+        let prepare = request(&fixture.backend, 1, None, false, Some(&first));
+        fixture.backend.begin(&prepare, Some(first));
+        fixture.wait_for_effect();
+        assert!(!fixture.policies().is_empty());
+        fixture
+            .backend
+            .prepare_shutdown(Instant::now() + Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if fixture.backend.quiesce().unwrap() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker retirement did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(fixture.policies().is_empty());
+        assert!(fixture.backend.worker.is_none());
+        assert!(fixture.backend.state.worker_policies.is_empty());
+        assert!(fixture.backend.state.pending_policies.is_none());
+        assert!(matches!(
+            fixture.backend.status(&status_request(&prepare)),
+            ProviderResponse::RecoveryRequired { .. }
+        ));
+        assert_eq!(fixture.backend.quiesce(), Ok(true));
+    }
+
+    #[test]
+    fn shutdown_retains_retirement_proof_across_a_failed_journal_write() {
+        let mut fixture = Fixture::new();
+        let first = policy(60000);
+        let prepare = request(&fixture.backend, 1, None, false, Some(&first));
+        fixture.run(&prepare, Some(first));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        fixture.backend.prepare_shutdown(deadline);
+        while !fixture.backend.worker.as_mut().unwrap().quiesce().unwrap() {
+            assert!(Instant::now() < deadline, "worker did not retire");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        fixture
+            .backend
+            .journal
+            .as_mut()
+            .unwrap()
+            .fail_next_save_for_test();
+        assert_eq!(
+            fixture.backend.quiesce(),
+            Err("injected_journal_write_failure")
+        );
+        assert!(
+            fixture.backend.worker.is_some(),
+            "exact exit proof was lost"
+        );
+        assert!(!fixture.backend.state.worker_policies.is_empty());
+        // Saving proven retirement does not start new native work and remains
+        // valid after the original host budget has expired.
+        fixture
+            .backend
+            .prepare_shutdown(Instant::now() - Duration::from_millis(1));
+        assert_eq!(fixture.backend.quiesce(), Ok(true));
+        assert!(fixture.backend.worker.is_none());
+        assert!(fixture.backend.state.worker_policies.is_empty());
+    }
+
+    #[test]
+    fn a_late_worker_inherits_the_first_announced_shutdown_deadline() {
+        let mut fixture = Fixture::new();
+        let expired = Instant::now() - Duration::from_millis(1);
+        fixture.backend.prepare_shutdown(expired);
+        fixture
+            .backend
+            .prepare_shutdown(Instant::now() + Duration::from_secs(300));
+        assert!(fixture.backend.worker.is_none());
+        let first = policy(60000);
+        let prepare = request(&fixture.backend, 1, None, false, Some(&first));
+        assert!(matches!(
+            fixture.run(&prepare, Some(first)),
+            ProviderResponse::Prepared { .. }
+        ));
+        assert_eq!(
+            fixture
+                .backend
+                .worker
+                .as_ref()
+                .unwrap()
+                .shutdown_deadline_for_test(),
+            Some(expired)
+        );
+        assert!(!fixture.policies().is_empty());
+        assert!(!fixture.backend.shutdown.started());
+    }
+
+    #[test]
+    fn shutdown_does_not_confirm_unexecuted_cleanup_for_an_unknown_target() {
+        let mut fixture = Fixture::new();
+        let release = request(&fixture.backend, 1, None, true, None);
+        assert!(matches!(
+            fixture.backend.begin(&release, None),
+            ProviderResponse::Pending { .. }
+        ));
+        assert!(fixture.backend.worker.is_none());
+        assert_eq!(fixture.backend.quiesce(), Ok(true));
+        assert!(matches!(
+            fixture.backend.status(&status_request(&release)),
+            ProviderResponse::RecoveryRequired { .. } | ProviderResponse::Rejected { .. }
+        ));
     }
 
     #[test]

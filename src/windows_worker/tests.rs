@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(windows)]
 fn reply(process: &Process) -> Reply {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -11,7 +12,162 @@ fn reply(process: &Process) -> Reply {
     }
 }
 
+#[cfg(not(windows))]
+fn shutdown_fixture(mode: &str) -> Worker {
+    let mut command = std::process::Command::new("python3");
+    command.args(["-I", "-u", "-c", "import json,sys,time\njson.loads(sys.stdin.readline())\nprint(json.dumps({'kind':'ready','snapshot':{'revision':2,'targets':[]}}),flush=True)\nfor line in sys.stdin: pass\nif sys.argv[1] != 'missing': print(json.dumps({'kind':'stopped'}),flush=True)\nif sys.argv[1] == 'linger': time.sleep(1)", mode]);
+    let mut worker =
+        Worker::new(std::env::temp_dir().join("amaterasu-unused-shutdown-fixture.json"));
+    let process = Process::spawn(command).unwrap();
+    process
+        .submit(&serde_json::to_value(&worker.config).unwrap())
+        .unwrap();
+    worker.process = Some(process);
+    worker.starting = Some(Instant::now());
+    worker.wanted = true;
+    pump(&mut worker, |worker| worker.snapshot.is_some());
+    worker
+}
+
+#[cfg(not(windows))]
 #[test]
+fn shutdown_announcement_preserves_consumer_callbacks_and_closes_legacy_admission() {
+    let mut worker = shutdown_fixture("clean");
+    worker.prepare_shutdown(0);
+    let deadline = worker.shutdown_deadline;
+    worker.prepare_shutdown(30_000);
+    assert_eq!(worker.shutdown_deadline, deadline);
+    worker.advance();
+    assert!(worker.process.as_mut().unwrap().is_running().unwrap());
+    assert!(!worker.shutdown_started);
+    assert_eq!(
+        worker.legacy("test", json!({"action":"apply"}), 100),
+        Err("host_stopping")
+    );
+    assert!(
+        worker
+            .legacy("test", json!({"action":"restore"}), 100)
+            .is_ok()
+    );
+    assert!(
+        worker
+            .legacy("test", json!({"action":"status"}), 100)
+            .is_ok()
+    );
+    let (request, policy) = callback(&worker, crate::windows_policy::Provider::Auto);
+    assert!(!worker.owns_target(&request.target));
+    assert!(matches!(
+        worker.begin(&request, Some(policy.clone()), 5_000),
+        ProviderResponse::Pending { .. }
+    ));
+    assert_ne!(worker.quiesce(), Ok(true));
+    let id = worker.receipts[&receipt_id(&request)];
+    assert!(matches!(
+        serde_json::from_value::<ProviderResponse>(worker.result(id).unwrap()).unwrap(),
+        ProviderResponse::Rejected { .. }
+    ));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn shutdown_requires_both_restoration_acknowledgement_and_exact_child_exit() {
+    for mode in ["clean", "missing"] {
+        let mut worker = shutdown_fixture(mode);
+        worker.prepare_shutdown(2_000);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let outcome = loop {
+            match worker.quiesce() {
+                Ok(false) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                outcome => break outcome,
+            }
+        };
+        assert_eq!(outcome.is_ok(), mode == "clean");
+        assert!(
+            worker.process.is_none(),
+            "confirmed child exit must retire the owned handle"
+        );
+        assert_eq!(worker.quiesce().is_ok(), mode == "clean");
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn expired_shutdown_never_renews_budget_or_confuses_acknowledgement_with_exit() {
+    let mut worker = shutdown_fixture("linger");
+    worker.prepare_shutdown(2_000);
+    assert_eq!(worker.quiesce(), Ok(false));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !worker.shutdown_restored {
+        assert_eq!(worker.quiesce(), Ok(false));
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(worker.process.as_mut().unwrap().is_running().unwrap());
+    worker.prepare_shutdown(0);
+    let retained = worker.shutdown_deadline;
+    assert!(worker.quiesce().is_err());
+    worker.prepare_shutdown(30_000);
+    assert_eq!(worker.shutdown_deadline, retained);
+    assert!(worker.quiesce().is_err());
+    assert!(!worker.shutdown_complete);
+    let started = Instant::now();
+    drop(worker);
+    assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unconfirmed_retirement_is_bounded_and_retains_the_owned_process() {
+    let mut worker = shutdown_fixture("clean");
+    let id = worker.submit(Operation::Ping, 30_000).unwrap();
+    worker.queue.clear();
+    worker.active = Some(id);
+    worker.retiring = Some(Retirement {
+        job: id,
+        deadline: Instant::now(),
+    });
+    let started = Instant::now();
+    worker.advance();
+    assert!(started.elapsed() < Duration::from_millis(200));
+    assert_eq!(worker.failure, Some("native_worker_tree_stop_unconfirmed"));
+    assert!(
+        worker.process.is_some(),
+        "failed confirmation must retain its exact native handle"
+    );
+    assert!(worker.result(id).is_some());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn shutdown_rejects_acknowledgement_with_a_missing_active_result() {
+    let mut worker = shutdown_fixture("clean");
+    let id = worker.submit(Operation::Ping, 5_000).unwrap();
+    worker.advance();
+    assert_eq!(worker.active, Some(id));
+    worker.prepare_shutdown(2_000);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match worker.quiesce() {
+            Ok(false) => {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(true) => panic!("missing operation result was accepted as clean shutdown"),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        worker.result(id).unwrap()["error"]["code"],
+        "native_worker_invalid_reply"
+    );
+    assert!(!worker.shutdown_complete);
+}
+
+#[test]
+#[cfg(windows)]
 #[ignore = "requires the independently built Windows frame-limiter DLL; uses private temporary journals"]
 fn packaged_dll_runs_its_private_worker_and_retires_without_host_native_effects() {
     let library = PathBuf::from(
@@ -193,6 +349,9 @@ fn stalled_calls_are_retired_and_fallback_requires_proven_absence_of_effects() {
             assert!(worker.config.disable_stalled_rtss);
             assert!(worker.failure.is_none());
         } else {
+            pump(&mut worker, |worker| {
+                !matches!(worker.status(&status), ProviderResponse::Pending { .. })
+            });
             assert!(matches!(
                 worker.status(&status),
                 ProviderResponse::RecoveryRequired { .. }

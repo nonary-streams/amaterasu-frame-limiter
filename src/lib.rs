@@ -34,11 +34,12 @@ mod rtss_profile;
 mod runtime;
 mod service;
 pub mod settings_descriptor;
+mod shutdown;
 #[cfg(any(windows, test))]
 mod windows_lifecycle;
 #[cfg(any(windows, test))]
 mod windows_policy;
-#[cfg(windows)]
+#[cfg(any(windows, all(test, target_os = "linux")))]
 mod windows_worker;
 
 pub use model::{

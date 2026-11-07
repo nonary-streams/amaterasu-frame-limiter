@@ -21,6 +21,7 @@ pub struct FrameLimiterModule {
     pending_native: std::collections::BTreeMap<u64, u64>,
     registry_principal: Option<String>,
     lifecycle: Option<crate::lifecycle::Bridge>,
+    shutdown: crate::shutdown::Shutdown,
 }
 
 impl ManagedModule for FrameLimiterModule {
@@ -67,7 +68,60 @@ impl ManagedModule for FrameLimiterModule {
                     crate::lifecycle::Bridge::configured(selection, &settings, native.clone())
                 })
                 .transpose()?,
+            shutdown: Default::default(),
         })
+    }
+
+    fn prepare_shutdown(&mut self, remaining_ms: u64) -> ModuleResult<()> {
+        let deadline = self.shutdown.announce(remaining_ms);
+        if let Some(lifecycle) = &mut self.lifecycle {
+            lifecycle.prepare_shutdown(deadline);
+        }
+        #[cfg(windows)]
+        self.native.borrow_mut().prepare_shutdown(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis() as u64,
+        );
+        Ok(())
+    }
+
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        let deadline = self.shutdown.begin();
+        let lifecycle_ready = match &mut self.lifecycle {
+            Some(lifecycle) => {
+                lifecycle.prepare_shutdown(deadline);
+                lifecycle.quiesce(&self.runtime)
+            }
+            None => Ok(true),
+        };
+        #[cfg(windows)]
+        let native_ready = {
+            let mut native = self.native.borrow_mut();
+            native.prepare_shutdown(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as u64,
+            );
+            native.quiesce().map_err(str::to_owned)
+        };
+        #[cfg(windows)]
+        let replies_ready = self
+            .complete_native_requests()
+            .map(|()| self.pending_native.is_empty());
+        #[cfg(not(windows))]
+        let native_ready: ModuleResult<bool> = if self.native.borrow().records().is_empty() {
+            Ok(true)
+        } else {
+            Err("frame-limiter compatibility leases remain unresolved".into())
+        };
+        #[cfg(not(windows))]
+        let replies_ready: ModuleResult<bool> = Ok(true);
+        let ready = lifecycle_ready? && native_ready? && replies_ready?;
+        if !ready && std::time::Instant::now() >= deadline {
+            return Err("frame-limiter shutdown deadline exceeded".into());
+        }
+        Ok(ready)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -119,6 +173,10 @@ impl ManagedModule for FrameLimiterModule {
                         }
                     })
                 } else {
+                    if external_effect_is_closed(&self.shutdown, &payload) {
+                        return self.complete(id, json!({"ok":false,"applied":false,
+                            "error":{"code":"provider_shutting_down","message":"Frame limiter is shutting down"}}));
+                    }
                     #[cfg(not(windows))]
                     {
                         handle_runtime_operation(&caller, payload, &mut self.native.borrow_mut())
@@ -145,6 +203,17 @@ impl ManagedModule for FrameLimiterModule {
             }
             response => Err(format!("frame-limiter poll failed: {response:?}")),
         }
+    }
+}
+
+fn external_effect_is_closed(shutdown: &crate::shutdown::Shutdown, payload: &Value) -> bool {
+    if shutdown.deadline().is_none() {
+        return false;
+    }
+    match crate::service::parse_operation(&payload.to_string()) {
+        Ok(crate::service::Operation::Apply(_)) => true,
+        Ok(crate::service::Operation::Restore(_)) => shutdown.started(),
+        _ => false,
     }
 }
 
@@ -227,3 +296,6 @@ pub(crate) fn default_journal_path() -> ModuleResult<PathBuf> {
         .join("frame-limiter")
         .join("leases.json"))
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

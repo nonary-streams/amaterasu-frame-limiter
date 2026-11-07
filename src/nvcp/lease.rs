@@ -411,7 +411,7 @@ pub(super) fn validate(state: &State) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) fn journal_has_effects(path: &std::path::Path) -> Result<bool, &'static str> {
     let Some(bytes) = super::journal::read(path)? else {
         return Ok(false);

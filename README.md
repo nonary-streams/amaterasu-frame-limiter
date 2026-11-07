@@ -134,8 +134,19 @@ Windows native effects execute in a separate process launched by the plugin
 from its already selected DLL. The plugin uses the system `rundll32.exe` and a
 private pipe; the host does not interpret the worker protocol or package an
 additional helper. The child belongs to a kill-on-close job and all parent I/O
-threads are retired before unloading the module. This is a fault-isolation
+uses bounded pipe polling without module-owned bridge threads. This is a fault-isolation
 boundary for trusted native code, not a permission sandbox.
+
+Host shutdown records the earliest announced deadline and closes new legacy
+apply admission. Declared lifecycle consumers keep their policy and can finish
+callbacks before dependency-ordered provider quiescence. Quiescence closes the
+worker input, continues bounded polling, and reports ready only after actual
+worker exit and verified policy retirement. Windows additionally requires the
+child's restoration acknowledgement and an empty owned process job. Linux
+requires successful EOF cleanup and absence of the temporary policy file before
+durably retiring receipts. A kill request, an expired budget, or an unknown
+cleanup target never establishes cleanup. Failed persistence retains the exact
+retirement proof for retry without creating another worker or renewing time.
 
 Lifecycle and compatibility requests remain asynchronous in the host process.
 The parent limits the queue to 32 requests and retains 256 completed receipts.

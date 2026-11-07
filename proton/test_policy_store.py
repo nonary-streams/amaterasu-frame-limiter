@@ -48,7 +48,9 @@ class PolicyStoreTests(unittest.TestCase):
         store.path.write_text(json.dumps(external), encoding="utf-8")
         with self.assertRaises(ValueError):
             store.refresh()
-        store.close()
+        with self.assertRaises(ValueError):
+            store.close()
+        self.assertIsNone(store.lock_fd)
         self.assertEqual(json.loads(store.path.read_text(encoding="utf-8")), external)
 
     def test_stale_cleanup_cannot_remove_a_newer_policy(self):
@@ -99,12 +101,15 @@ class PolicyStoreTests(unittest.TestCase):
     def test_recovery_accepts_only_owned_journaled_policy_snapshots(self):
         before = self.policy
         after = dict(before, limit_millihz=120000)
-        with PolicyStore(self.root) as store:
-            path = store.path
-            store.set("session", None, "r1", before)
-            state = json.loads(path.read_text())
-            state["owner"]["expires_unix_ms"] = 0
-            path.write_text(json.dumps(state))
+        store = PolicyStore(self.root)
+        path = store.path
+        store.set("session", None, "r1", before)
+        state = json.loads(path.read_text())
+        state["owner"]["expires_unix_ms"] = 0
+        path.write_text(json.dumps(state))
+        with self.assertRaises(ValueError):
+            store.close()
+        self.assertIsNone(store.lock_fd)
         for expected in ([[before], [after]], [[after], [before]]):
             path.write_text(json.dumps(state))
             with PolicyStore(self.root, "standalone", expected) as recovered:

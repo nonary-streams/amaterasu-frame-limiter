@@ -207,8 +207,12 @@ class PolicyStore:
             return
         try:
             _, inode = self._read_current()
-            if inode is not None and inode == self._owned_inode:
+            if inode != self._owned_inode:
+                raise ValueError("runtime state changed externally during close")
+            if inode is not None:
                 self.path.unlink()
+            self._owned_inode = None
+            self._policies.clear()
         finally:
             os.close(self.lock_fd)
             self.lock_fd = None

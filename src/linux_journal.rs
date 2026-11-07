@@ -208,6 +208,14 @@ impl State {
     }
 
     pub(crate) fn retire_after_worker_restart(&mut self) -> Result<(), &'static str> {
+        let known_cleanup: BTreeSet<_> = self
+            .receipts
+            .iter()
+            .filter(|(_, receipt)| {
+                receipt.is_cleanup() && self.ownership.knows_target(&receipt.target)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
         self.ownership.retire_after_worker_restart()?;
         self.worker_policies.clear();
         self.pending_policies = None;
@@ -221,14 +229,19 @@ impl State {
             .filter(|(_, receipt)| receipt.response.is_none())
             .map(|(id, _)| id.clone())
             .collect();
-        for receipt in self.receipts.values_mut() {
-            if receipt.response.is_none() {
+        for (id, receipt) in &mut self.receipts {
+            if receipt.response.is_none() && (!receipt.is_cleanup() || known_cleanup.contains(id)) {
                 self.ownership.remember_retired_target(&receipt.target)?;
             }
             let response = match &receipt.response {
                 Some(ProviderResponse::Rejected { .. })
                 | Some(ProviderResponse::Cleanup { .. }) => receipt.response.clone().unwrap(),
-                _ if receipt.is_cleanup() => receipt.expected_response.clone(),
+                _ if receipt.is_cleanup() && known_cleanup.contains(id) => {
+                    receipt.expected_response.clone()
+                }
+                _ if receipt.is_cleanup() => ProviderResponse::RecoveryRequired {
+                    reason: "policy_ownership_unknown".into(),
+                },
                 _ => ProviderResponse::RecoveryRequired {
                     reason: "policy_retired_after_restart".into(),
                 },
@@ -274,6 +287,8 @@ pub(crate) struct Journal {
     directory: File,
     _lock: File,
     current: Option<Identity>,
+    #[cfg(test)]
+    fail_next_save: bool,
 }
 
 impl Journal {
@@ -366,6 +381,8 @@ impl Journal {
             directory,
             _lock: lock,
             current: None,
+            #[cfg(test)]
+            fail_next_save: false,
         };
         match journal.read()? {
             Some((file, bytes)) => {
@@ -427,6 +444,10 @@ impl Journal {
     }
 
     pub(crate) fn save(&mut self, state: &State) -> Result<(), &'static str> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_save) {
+            return Err("injected_journal_write_failure");
+        }
         state.validate()?;
         let content = serde_json::to_vec(state).map_err(|_| "invalid_lifecycle_journal")?;
         if content.len() as u64 > MAX_BYTES {
@@ -472,6 +493,11 @@ impl Journal {
             unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) };
         }
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_save_for_test(&mut self) {
+        self.fail_next_save = true;
     }
 }
 
@@ -670,6 +696,11 @@ mod tests {
                 outcomes: vec![],
                 outputs: vec![],
             };
+            if sequence > 256 {
+                // Pending cleanup belongs to a previously verified target;
+                // arbitrary unknown receipts cannot acquire retirement proof.
+                state.ownership.remember_retired_target(&target).unwrap();
+            }
             state.receipts.insert(
                 id.clone(),
                 Receipt {

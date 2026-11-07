@@ -1,4 +1,6 @@
 import json
+from collections import OrderedDict
+import os
 from pathlib import Path
 import select
 import subprocess
@@ -10,6 +12,7 @@ from unittest import mock
 
 import amaterasu_limiter
 from policy_store import PolicyStore
+import worker as limiter_worker
 
 
 class WorkerTests(unittest.TestCase):
@@ -19,6 +22,42 @@ class WorkerTests(unittest.TestCase):
         if not readable:
             raise AssertionError("worker did not reply")
         return json.loads(process.stdout.readline())
+
+    def test_close_ack_follows_owned_policy_removal(self):
+        with tempfile.TemporaryDirectory(prefix="amaterasu-limiter-close-") as root:
+            with PolicyStore(root) as store:
+                policy = {"app_id": None, "provider": "proton", "limit_millihz": 59940,
+                          "preset": "custom", "method": "late", "graph": False}
+                store.set("s", None, "r1", policy)
+                self.assertTrue(store.path.exists())
+
+                def completed(request_id, ok, **fields):
+                    self.assertEqual(request_id, 7)
+                    self.assertTrue(ok)
+                    self.assertEqual(fields["state"], "closed")
+                    self.assertFalse(store.path.exists(), "close ACK preceded policy retirement")
+                    self.assertIsNone(store.lock_fd)
+
+                with mock.patch.object(limiter_worker, "_reply", side_effect=completed):
+                    self.assertFalse(limiter_worker._handle(
+                        json.dumps({"id": 7, "operation": "close"}), store, b"", OrderedDict()))
+
+    def test_changed_policy_close_reports_unknown_and_preserves_replacement(self):
+        with tempfile.TemporaryDirectory(prefix="amaterasu-limiter-close-conflict-") as root:
+            with PolicyStore(root) as store:
+                policy = {"app_id": None, "provider": "proton", "limit_millihz": 59940,
+                          "preset": "custom", "method": "late", "graph": False}
+                store.set("s", None, "r1", policy)
+                replacement = store.directory / "replacement.json"
+                replacement.write_text('{"foreign":true}')
+                os.replace(replacement, store.path)
+                with mock.patch.object(limiter_worker, "_reply") as reply:
+                    limiter_worker._handle(json.dumps({"id": 8, "operation": "close"}),
+                                           store, b"", OrderedDict())
+                self.assertFalse(reply.call_args.kwargs["ok"])
+                self.assertEqual(reply.call_args.kwargs["outcome"], "unknown")
+                self.assertEqual(store.path.read_text(), '{"foreign":true}')
+                self.assertIsNone(store.lock_fd)
 
     def test_abrupt_worker_death_makes_existing_hook_state_inert(self):
         with tempfile.TemporaryDirectory(prefix="amaterasu-limiter-worker-") as root:

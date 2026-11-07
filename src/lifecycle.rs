@@ -147,11 +147,13 @@ struct Pending {
     timeout_ms: u64,
     stage: Stage,
     abandoned: bool,
+    dispatched: bool,
 }
 
 pub(crate) struct Bridge {
     selected: Selection,
     pending: VecDeque<Pending>,
+    shutdown: crate::shutdown::Shutdown,
     #[cfg(target_os = "linux")]
     backend: crate::linux_lifecycle::Backend,
     #[cfg(windows)]
@@ -188,11 +190,38 @@ impl Bridge {
         Self {
             selected,
             pending: VecDeque::new(),
+            shutdown: Default::default(),
             #[cfg(target_os = "linux")]
             backend: crate::linux_lifecycle::Backend::from_environment(),
             #[cfg(windows)]
             windows: None,
         }
+    }
+
+    pub(crate) fn prepare_shutdown(&mut self, deadline: Instant) {
+        let deadline = self.shutdown.announce_until(deadline);
+        #[cfg(target_os = "linux")]
+        self.backend.prepare_shutdown(deadline);
+        #[cfg(not(target_os = "linux"))]
+        let _ = deadline;
+    }
+
+    pub(crate) fn quiesce(&mut self, runtime: &RuntimeClient) -> ModuleResult<bool> {
+        let deadline = self.shutdown.begin();
+        for pending in &mut self.pending {
+            pending.abandoned = true;
+        }
+        #[cfg(target_os = "linux")]
+        let native = self.backend.quiesce().map_err(str::to_owned);
+        #[cfg(not(target_os = "linux"))]
+        let native: ModuleResult<bool> = Ok(true);
+        // Context reads carry no native mutation, but their broker identities
+        // still need cancellation/release before the module can unload.
+        self.advance(runtime)?;
+        if !self.pending.is_empty() && Instant::now() >= deadline {
+            return Err("frame-limiter context drain deadline exceeded".into());
+        }
+        Ok(native? && self.pending.is_empty())
     }
 
     /// `None` means a valid call was queued; an immediate reply is otherwise returned.
@@ -240,6 +269,9 @@ impl Bridge {
             #[cfg(not(any(target_os = "linux", windows)))]
             return Some(json!({"status":"recovery_required","reason":"unknown_receipt"}));
         }
+        if self.shutdown.started() {
+            return reject("provider_shutting_down");
+        }
         let expected = match method {
             "resource_plan" => ProviderOperation::ResourcePlan,
             "lifecycle_callback" => ProviderOperation::LifecycleCallback,
@@ -280,6 +312,7 @@ impl Bridge {
             timeout_ms,
             stage: Stage::Submit,
             abandoned: false,
+            dispatched: false,
         });
         None
     }
@@ -307,7 +340,7 @@ impl Bridge {
         }
         if pending.abandoned {
             pending.stage = match pending.stage {
-                Stage::Submit => return Ok(()),
+                Stage::Submit if !pending.dispatched => return Ok(()),
                 Stage::Wait(id) => Stage::Cancel(id),
                 Stage::Release(id, _) => Stage::CancelRelease(id),
                 other => other,
@@ -321,6 +354,7 @@ impl Bridge {
                     provider_request: pending.request.clone(),
                 })
                 .map_err(|error| error.to_string())?;
+                pending.dispatched = true;
                 match runtime.send(Command::Request {
                     service: self.selected.service.clone(),
                     payload,
@@ -331,8 +365,18 @@ impl Bridge {
                     Ok(Response::Accepted { id }) => pending.stage = Stage::Wait(id),
                     Ok(Response::Error { code, .. }) => {
                         eprintln!("frame limiter context request rejected code={code}");
-                        completion =
-                            Some(json!({"status":"rejected","reason":"context_unavailable"}))
+                        if self.shutdown.started()
+                            && matches!(code.as_str(), "unavailable" | "resource_exhausted")
+                        {
+                            // Plain Request retries resolve their retained
+                            // operation identity before provider/capacity checks.
+                            // These replies prove no matching broker read remains.
+                            return Ok(());
+                        }
+                        if !self.shutdown.started() {
+                            completion =
+                                Some(json!({"status":"rejected","reason":"context_unavailable"}));
+                        }
                     }
                     _ => (), // Retry the same read identity after uncertain admission.
                 }
@@ -915,5 +959,80 @@ mod tests {
         assert!(
             matches!(&host.commands[complete],Command::Complete {payload,..} if payload["status"] == "planned")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_retires_context_only_after_a_definitive_absence_response() {
+        use amaterasu_module_sdk::abi;
+        use std::ffi::c_void;
+
+        struct Host {
+            rejection: Option<&'static str>,
+            operation_ids: Vec<String>,
+        }
+        unsafe extern "C" fn invoke(
+            context: *mut c_void,
+            input: abi::BorrowedBytes,
+            reply: abi::ReplySink,
+        ) -> abi::Status {
+            // SAFETY: the boxed fixture outlives this serialized callback.
+            let host = unsafe { &mut *context.cast::<Host>() };
+            // SAFETY: the SDK lends input only during this invocation.
+            let command: Command =
+                serde_json::from_slice(unsafe { input.read() }.unwrap()).unwrap();
+            let response = match command {
+                Command::CheckRequest { .. } => Response::Ok,
+                Command::Request { operation_id, .. } => {
+                    host.operation_ids.push(operation_id);
+                    let Some(code) = host.rejection else {
+                        return abi::STATUS_INTERNAL_ERROR;
+                    };
+                    Response::Error {
+                        code: code.into(),
+                        message: "fixture rejection".into(),
+                    }
+                }
+                _ => return abi::STATUS_INVALID_ARGUMENT,
+            };
+            let bytes = serde_json::to_vec(&response).unwrap();
+            // SAFETY: the synchronous sink copies bytes before return.
+            unsafe { reply.send(&bytes) };
+            abi::STATUS_OK
+        }
+
+        for code in [
+            "unavailable",
+            "resource_exhausted",
+            "conflict",
+            "permission_denied",
+        ] {
+            let mut host = Box::new(Host {
+                rejection: None,
+                operation_ids: vec![],
+            });
+            let endpoint = abi::HostApi {
+                header: abi::AbiHeader::of::<abi::HostApi>(),
+                context: (&mut *host as *mut Host).cast(),
+                invoke,
+            };
+            // SAFETY: endpoint and host remain live until after the client.
+            let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+            let mut bridge = Bridge::new(Selection {
+                principal: "coordinator".into(),
+                service: "lifecycle/1".into(),
+            });
+            let payload = json!({"method":"resource_plan","interface_major":1,
+                "interface_minor":0,"arguments":request("none")});
+            assert!(bridge.accept(7, "coordinator", payload, 5000).is_none());
+            bridge.advance(&runtime).unwrap();
+            host.rejection = Some(code);
+            assert_eq!(
+                bridge.quiesce(&runtime).unwrap(),
+                matches!(code, "unavailable" | "resource_exhausted")
+            );
+            assert_eq!(host.operation_ids.len(), 2);
+            assert_eq!(host.operation_ids[0], host.operation_ids[1]);
+        }
     }
 }

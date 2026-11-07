@@ -617,7 +617,6 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         RestoreOutcome::Restored(restored)
     }
 
-    #[cfg(any(windows, test))]
     pub(crate) fn records(&self) -> Vec<LeaseRecord> {
         self.leases.values().cloned().collect()
     }
@@ -1540,7 +1539,7 @@ fn load_journal(path: &Path) -> Result<Journal, &'static str> {
     Ok(journal)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(crate) fn journal_has_effects(path: &Path) -> Result<bool, &'static str> {
     Ok(!load_journal(path)?.leases.is_empty())
 }
