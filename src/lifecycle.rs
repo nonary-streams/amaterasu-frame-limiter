@@ -516,6 +516,31 @@ impl Bridge {
                 Err(_) => json!({"status":"rejected","reason":"invalid_join_context"}),
             };
         }
+        // A retained callback owns its immutable admitted policy and response.
+        // Resolve it before current settings can select a different/no-op policy;
+        // begin still checks the complete recorded request fingerprint.
+        #[cfg(target_os = "linux")]
+        if request.operation == ProviderOperation::LifecycleCallback
+            && self.backend.has_receipt(request)
+        {
+            let response = self.backend.begin_with_budget(request, None, remaining_ms);
+            return response_value(request, Ok(response));
+        }
+        #[cfg(windows)]
+        if request.operation == ProviderOperation::LifecycleCallback
+            && self
+                .windows
+                .as_ref()
+                .is_some_and(|worker| worker.borrow().has_receipt(request))
+        {
+            let response = self
+                .windows
+                .as_ref()
+                .expect("known worker")
+                .borrow_mut()
+                .begin(request, None, remaining_ms);
+            return response_value(request, Ok(response));
+        }
         let releasing = matches!(
             request.phase,
             LifecyclePhase::SessionRelease | LifecyclePhase::StreamRelease
@@ -589,16 +614,26 @@ impl Bridge {
             return no_op_response(request);
         }
         #[cfg(target_os = "linux")]
-        let decision = crate::lifecycle_policy::proton_policy(
-            &serde_json::to_value(&request.settings).unwrap_or(Value::Null),
-            &context.context,
-            self.backend.mangohud_available(),
-        );
+        let decision = match self.backend.inherited_policy(&request.target) {
+            Some(policy) => Ok(Some(policy)),
+            None => crate::lifecycle_policy::proton_policy(
+                &serde_json::to_value(&request.settings).unwrap_or(Value::Null),
+                &context.context,
+                self.backend.mangohud_available(),
+            ),
+        };
         #[cfg(windows)]
-        let decision = crate::windows_policy::resolve(
-            &serde_json::to_value(&request.settings).unwrap_or(Value::Null),
-            &context.context,
-        );
+        let decision = match self
+            .windows
+            .as_ref()
+            .and_then(|worker| worker.borrow().retained_policy(&request.target))
+        {
+            Some(policy) => Ok(Some(policy)),
+            None => crate::windows_policy::resolve(
+                &serde_json::to_value(&request.settings).unwrap_or(Value::Null),
+                &context.context,
+            ),
+        };
         #[cfg(not(any(target_os = "linux", windows)))]
         let decision = unavailable_backend_policy(
             &serde_json::to_value(&request.settings).unwrap_or(Value::Null),
@@ -1034,5 +1069,102 @@ mod tests {
             assert_eq!(host.operation_ids.len(), 2);
             assert_eq!(host.operation_ids[0], host.operation_ids[1]);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_stream_receipt_precedes_disabled_client_policy_resolution() {
+        fn commit(bridge: &mut Bridge, mut request: ProviderRequest) -> (ProviderRequest, Value) {
+            let planned: extension_api::ProviderResponse =
+                serde_json::from_value(bridge.evaluate(&request, context(&request))).unwrap();
+            let extension_api::ProviderResponse::Planned { plan } = planned else {
+                panic!("plan rejected: {planned:?}");
+            };
+            request.operation = ProviderOperation::LifecycleCallback;
+            request.operation_id = format!("callback-{}", request.provider_sequence);
+            request.plan_revision = Some(plan.revision);
+            request.admission_id = Some(format!("admitted-{}", request.provider_sequence));
+            request.approved_plan = Some(plan);
+            let extension_api::ProviderResponse::Pending { receipt_id } =
+                serde_json::from_value(bridge.evaluate(&request, context(&request))).unwrap()
+            else {
+                panic!("callback not admitted")
+            };
+            let status = extension_api::ProviderStatusRequest {
+                provider_sequence: request.provider_sequence,
+                operation_id: request.operation_id.clone(),
+                transition_id: request.transition_id.clone(),
+                receipt_id,
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                bridge.backend.advance();
+                let response = bridge.backend.status(&status);
+                if !matches!(response, extension_api::ProviderResponse::Pending { .. }) {
+                    return (request, serde_json::to_value(response).unwrap());
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let root = Root(
+            std::env::temp_dir().join(format!("limiter-bridge-{:x}", u128::from_le_bytes(nonce))),
+        );
+        let steam = root.0.join("steam");
+        let tool = steam.join("steamapps/common/ProtonFixture");
+        std::fs::create_dir_all(&tool).unwrap();
+        std::fs::write(tool.join("proton"), "fixture").unwrap();
+        std::fs::write(tool.join("user_settings.sample.py"), "user_settings = {}\n").unwrap();
+        let mut bridge = Bridge::new(Selection {
+            principal: "coordinator".into(),
+            service: "lifecycle/1".into(),
+        });
+        bridge.backend = crate::linux_lifecycle::Backend::configured(&json!({
+            "proton_runtime_directory":root.0,"proton_state_directory":root.0,
+            "proton_steam_roots":[steam]
+        }))
+        .unwrap();
+        let mut root_request = request("proton");
+        root_request
+            .settings
+            .insert("frame_limiter_enable".into(), json!(true));
+        root_request
+            .settings
+            .insert("frame_limiter_fps_limit".into(), json!(59.94));
+        let (root_callback, _) = commit(&mut bridge, root_request);
+        let mut stream = request("none");
+        stream.provider_sequence = 2;
+        stream.transition_id = "stream".into();
+        stream.operation_id = "stream-plan".into();
+        stream.phase = LifecyclePhase::StreamPrepare;
+        stream.target = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch",
+            "session_id":"session","stream_id":"first","generation":1}))
+        .unwrap();
+        let (stream_callback, prepared) = commit(&mut bridge, stream);
+        assert_eq!(prepared["obligations"].as_array().unwrap().len(), 1);
+        let mut release = root_callback;
+        release.provider_sequence = 3;
+        release.transition_id = "root-end".into();
+        release.operation = ProviderOperation::ResourcePlan;
+        release.operation_id = "root-end-plan".into();
+        release.phase = LifecyclePhase::SessionRelease;
+        release.reason = Some(extension_api::ReleaseReason::End);
+        release.plan_revision = None;
+        release.admission_id = None;
+        release.approved_plan = None;
+        commit(&mut bridge, release);
+        assert_eq!(
+            bridge.evaluate(&stream_callback, context(&stream_callback)),
+            prepared
+        );
     }
 }

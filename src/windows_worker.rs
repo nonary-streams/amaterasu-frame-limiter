@@ -58,6 +58,8 @@ struct Call {
 struct Snapshot {
     revision: u64,
     targets: Vec<String>,
+    #[serde(default)]
+    root: Option<crate::windows_lifecycle::ownership::Root>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -169,6 +171,23 @@ impl Worker {
             .is_some_and(|snapshot| snapshot.targets.contains(&id))
     }
 
+    pub(crate) fn retained_policy(&self, target: &api::LifecycleTarget) -> Option<Policy> {
+        let root = self.snapshot.as_ref()?.root.as_ref()?;
+        let (group, identity) = crate::windows_lifecycle::target_identity(target).ok()?;
+        (matches!(target, api::LifecycleTarget::Stream { .. })
+            && (root.application || root.streams.contains(&identity))
+            && root.phase == crate::windows_lifecycle::ownership::Phase::Active
+            && group
+                == crate::windows_lifecycle::target_identity(&root.target)
+                    .ok()?
+                    .0)
+            .then(|| root.policy.clone())
+    }
+
+    pub(crate) fn has_receipt(&self, request: &ProviderRequest) -> bool {
+        self.receipts.contains_key(&receipt_id(request))
+    }
+
     pub(crate) fn plan(
         &self,
         request: &ProviderRequest,
@@ -178,6 +197,10 @@ impl Worker {
             return Err(reason);
         }
         let snapshot = self.snapshot.as_ref().ok_or("native_worker_not_ready")?;
+        let retained = (request.phase == api::LifecyclePhase::StreamPrepare)
+            .then(|| self.retained_policy(&request.target))
+            .flatten();
+        let policy = retained.as_ref().or(policy);
         let policy = policy
             .map(serde_json::to_value)
             .transpose()
@@ -191,6 +214,11 @@ impl Worker {
         policy: Option<Policy>,
         remaining_ms: u64,
     ) -> ProviderResponse {
+        let supplied = policy.clone();
+        let policy = match crate::windows_lifecycle::callback_policy(request, policy) {
+            Ok(policy) => policy,
+            Err(reason) => return recovery(reason),
+        };
         if let Some(reason) = self.failure {
             return recovery(reason);
         }
@@ -202,6 +230,12 @@ impl Worker {
             };
         }
         let receipt = receipt_id(request);
+        let mismatch = supplied
+            .as_ref()
+            .is_some_and(|supplied| policy.as_ref() != Some(supplied));
+        let inherited = request.phase == api::LifecyclePhase::StreamPrepare
+            && self.retained_policy(&request.target).as_ref() == policy.as_ref();
+        let requires_policy = policy.is_some();
         let operation = Operation::Lifecycle {
             request: Box::new(request.clone()),
             policy,
@@ -222,6 +256,16 @@ impl Worker {
                 .unwrap_or(ProviderResponse::Pending {
                     receipt_id: receipt,
                 });
+        }
+        if mismatch && !inherited {
+            return ProviderResponse::Rejected {
+                reason: "admission_mismatch".into(),
+            };
+        }
+        if supplied.is_none() && requires_policy {
+            return ProviderResponse::Rejected {
+                reason: "missing_policy".into(),
+            };
         }
         if let Some(reason) = self.failure {
             return recovery(reason);
@@ -593,6 +637,20 @@ fn receipt_id(request: &ProviderRequest) -> String {
     )
 }
 fn validate_snapshot(snapshot: &Snapshot) -> Result<(), &'static str> {
+    if let Some(root) = &snapshot.root {
+        crate::windows_lifecycle::ownership::validate_root(root)?;
+        if !snapshot
+            .targets
+            .contains(&crate::windows_lifecycle::target_identity(&root.target)?.1)
+            || root
+                .streams
+                .iter()
+                .chain(&root.releasing)
+                .any(|target| !snapshot.targets.contains(target))
+        {
+            return Err("native_worker_invalid_snapshot");
+        }
+    }
     if snapshot.revision == 0
         || snapshot.targets.len() > 1024
         || snapshot

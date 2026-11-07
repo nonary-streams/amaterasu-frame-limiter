@@ -193,6 +193,8 @@ struct Journal {
     leases: Vec<LeaseRecord>,
     #[serde(default)]
     completed: Vec<CompletedLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_lifecycle: Option<serde_json::Value>,
 }
 
 impl Default for Journal {
@@ -202,6 +204,7 @@ impl Default for Journal {
             revision: initial_revision(),
             leases: Vec::new(),
             completed: Vec::new(),
+            windows_lifecycle: None,
         }
     }
 }
@@ -219,6 +222,7 @@ pub(crate) struct LeaseManager<P> {
     completed: BTreeMap<String, CompletedLease>,
     journal_path: Option<PathBuf>,
     revision: u64,
+    windows_lifecycle: Option<serde_json::Value>,
 }
 
 fn initial_revision() -> u64 {
@@ -234,6 +238,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             completed: BTreeMap::new(),
             journal_path: None,
             revision: initial_revision(),
+            windows_lifecycle: None,
         }
     }
 
@@ -255,7 +260,26 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             completed,
             journal_path: Some(path),
             revision: journal.revision,
+            windows_lifecycle: journal.windows_lifecycle,
         })
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn windows_lifecycle(&self) -> Option<&serde_json::Value> {
+        self.windows_lifecycle.as_ref()
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn save_windows_lifecycle(
+        &mut self,
+        state: serde_json::Value,
+    ) -> Result<(), &'static str> {
+        let previous = self.windows_lifecycle.replace(state);
+        if let Err(reason) = self.persist() {
+            self.windows_lifecycle = previous;
+            return Err(reason);
+        }
+        Ok(())
     }
 
     pub(crate) fn apply(&mut self, request: LeaseApplyRequest<'_>) -> ApplyOutcome {
@@ -533,6 +557,27 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             self.provider.retire_idle()?;
         }
         Ok(())
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn restore_exact_lease(
+        &mut self,
+        owner: &str,
+        session: &str,
+        lease: &str,
+    ) -> RestoreOutcome {
+        let matches = self
+            .leases
+            .get(lease)
+            .is_some_and(|record| record.owner == owner && record.session_id == session)
+            || self
+                .completed
+                .get(lease)
+                .is_some_and(|record| record.owner == owner && record.session_id == session);
+        if !matches {
+            return RestoreOutcome::NotFound;
+        }
+        self.restore(owner, None, Some(lease))
     }
 
     pub(crate) fn restore(
@@ -952,11 +997,12 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             .checked_add(1)
             .ok_or("lease_revision_exhausted")?;
         if let Some(path) = &self.journal_path {
-            save_journal(
+            save_journal_with_lifecycle(
                 path,
                 next,
                 self.leases.values().cloned().collect(),
                 self.completed.values().cloned().collect(),
+                self.windows_lifecycle.clone(),
             )?;
         }
         self.revision = next;
@@ -1541,14 +1587,28 @@ fn load_journal(path: &Path) -> Result<Journal, &'static str> {
 
 #[cfg(any(windows, test))]
 pub(crate) fn journal_has_effects(path: &Path) -> Result<bool, &'static str> {
-    Ok(!load_journal(path)?.leases.is_empty())
+    let journal = load_journal(path)?;
+    let roots =
+        crate::windows_lifecycle::ownership::State::decode(journal.windows_lifecycle.as_ref())?;
+    Ok(!journal.leases.is_empty() || roots.root.is_some())
 }
 
+#[cfg(test)]
 fn save_journal(
     path: &Path,
     revision: u64,
     leases: Vec<LeaseRecord>,
     completed: Vec<CompletedLease>,
+) -> Result<(), &'static str> {
+    save_journal_with_lifecycle(path, revision, leases, completed, None)
+}
+
+fn save_journal_with_lifecycle(
+    path: &Path,
+    revision: u64,
+    leases: Vec<LeaseRecord>,
+    completed: Vec<CompletedLease>,
+    windows_lifecycle: Option<serde_json::Value>,
 ) -> Result<(), &'static str> {
     let parent = path.parent().ok_or("lease_journal_invalid_path")?;
     fs::create_dir_all(parent).map_err(|_| "lease_journal_unavailable")?;
@@ -1561,15 +1621,31 @@ fn save_journal(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         _ => return Err("lease_journal_invalid_path"),
     }
+    // A native restore may be complete while its final logical-root checkpoint
+    // is still owed. Keep that exact proof within the existing bounded history.
+    let pinned = windows_lifecycle
+        .as_ref()
+        .and_then(|state| state.get("root"))
+        .and_then(|root| root.get("rtss_lease"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|identity| completed.iter().find(|record| record.lease_id == identity))
+        .cloned();
+    let completed = pinned
+        .iter()
+        .cloned()
+        .chain(completed.into_iter().rev().filter(|record| {
+            pinned
+                .as_ref()
+                .is_none_or(|pinned| pinned.lease_id != record.lease_id)
+        }))
+        .take(COMPLETED_LEASE_LIMIT)
+        .collect();
     let journal = Journal {
         format_version: JOURNAL_FORMAT,
         revision,
         leases,
-        completed: completed
-            .into_iter()
-            .rev()
-            .take(COMPLETED_LEASE_LIMIT)
-            .collect(),
+        completed,
+        windows_lifecycle,
     };
     let bytes = serde_json::to_vec(&journal).map_err(|_| "lease_journal_unavailable")?;
     if bytes.len() as u64 > JOURNAL_LIMIT_BYTES {
@@ -2968,6 +3044,41 @@ mod tests {
         assert_eq!(response["state"], "not_found");
         assert_eq!(response["provider_availability"], "unavailable");
         assert_eq!(response["diagnostics"][1], "fake_provider_unavailable");
+    }
+
+    #[test]
+    fn pending_windows_root_pins_its_completed_native_restore_proof() {
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-root-proof-{}-{}",
+            std::process::id(),
+            NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = directory.join("leases.json");
+        let completed = (0..300)
+            .map(|index| CompletedLease {
+                lease_id: format!("lease-{index:03}"),
+                owner: ":lifecycle".into(),
+                session_id: format!("session-{index:03}"),
+            })
+            .collect();
+        save_journal_with_lifecycle(
+            &path,
+            1,
+            vec![],
+            completed,
+            Some(serde_json::json!({"root":{"rtss_lease":"lease-000"}})),
+        )
+        .unwrap();
+        let journal = load_journal(&path).unwrap();
+        assert_eq!(journal.completed.len(), COMPLETED_LEASE_LIMIT);
+        assert!(
+            journal
+                .completed
+                .iter()
+                .any(|record| record.lease_id == "lease-000"),
+            "pending root lost the proof required to finish cleanup"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

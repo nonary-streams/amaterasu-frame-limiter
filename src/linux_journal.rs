@@ -90,6 +90,8 @@ pub(crate) struct State {
     pub revision: u64,
     pub ownership: Ownership,
     pub worker_policies: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub root_policies: BTreeMap<String, Value>,
     pub pending_policies: Option<BTreeMap<String, Value>>,
     pub receipts: BTreeMap<String, Receipt>,
     pub completed: VecDeque<String>,
@@ -103,6 +105,7 @@ impl State {
             revision: 1,
             ownership: Ownership::default(),
             worker_policies: BTreeMap::new(),
+            root_policies: BTreeMap::new(),
             pending_policies: None,
             receipts: BTreeMap::new(),
             completed: VecDeque::new(),
@@ -118,6 +121,7 @@ impl State {
             revision: 1,
             ownership: Ownership::default(),
             worker_policies: BTreeMap::new(),
+            root_policies: BTreeMap::new(),
             pending_policies: None,
             receipts: BTreeMap::new(),
             completed: VecDeque::new(),
@@ -131,6 +135,10 @@ impl State {
             || !self.owner_id.bytes().all(|byte| byte.is_ascii_hexdigit())
             || self.receipts.len() > MAX_RECEIPTS
             || self.worker_policies.len() > 32
+            || self.root_policies.len() > 32
+            || self.root_policies.iter().any(|(key, policy)| {
+                !self.ownership.has_root(key) || self.worker_policies.get(key) != Some(policy)
+            })
             || self
                 .pending_policies
                 .as_ref()
@@ -218,6 +226,7 @@ impl State {
             .collect();
         self.ownership.retire_after_worker_restart()?;
         self.worker_policies.clear();
+        self.root_policies.clear();
         self.pending_policies = None;
         self.revision = self
             .revision
@@ -247,6 +256,25 @@ impl State {
                 },
             };
             receipt.response = Some(response);
+        }
+        // Native retirement proves the policies absent, but target hashes alone
+        // do not prove the application ended. Reconcile only exact admitted
+        // root-release receipts whose cleanup is now confirmed.
+        let ended_roots: Vec<_> = self
+            .receipts
+            .iter()
+            .filter(|(id, receipt)| {
+                known_cleanup.contains(*id)
+                    && matches!(receipt.target, LifecycleTarget::Session { .. })
+                    && matches!(receipt.response, Some(ProviderResponse::Cleanup { .. }))
+            })
+            .map(|(_, receipt)| receipt.target.clone())
+            .collect();
+        for target in ended_roots {
+            if self.ownership.release(&target)?.is_some() {
+                return Err("policy_ownership_not_retired");
+            }
+            self.ownership.finish_session_if_idle(&target)?;
         }
         for id in pending {
             let response = self.receipts[&id]

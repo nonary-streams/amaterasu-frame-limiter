@@ -1,8 +1,8 @@
 //! Provider-owned generations for Proton policy transitions.
 //!
-//! The worker performs the actual compare-and-set. This ledger must only be
-//! committed after the worker confirms the exact effect; an uncertain outcome
-//! remains a recovery problem rather than permission to retry a mutation.
+//! The application root and its current stream have independent worker entries.
+//! Changes commit only after the exact native compare-and-set is acknowledged;
+//! uncertain effects stay fenced until verified worker retirement.
 use amaterasu_module_sdk::extension_api::LifecycleTarget;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,9 +22,59 @@ struct Binding {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Session {
+    // Older journals stored either a session or stream here. Preserve that exact
+    // binding until verified recovery retires it; never synthesize a root from
+    // a retired target hash or a legacy stream binding.
     current: Option<Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retiring_root: Option<LifecycleTarget>,
     retired: BTreeSet<String>,
     generation: u64,
+}
+
+impl Session {
+    fn root(&self) -> Option<&Binding> {
+        self.root.as_ref().or_else(|| {
+            self.current
+                .as_ref()
+                .filter(|binding| matches!(binding.target, LifecycleTarget::Session { .. }))
+        })
+    }
+
+    fn binding(&self, target: &LifecycleTarget) -> Option<&Binding> {
+        match target {
+            LifecycleTarget::Session { .. } => self.root(),
+            LifecycleTarget::Stream { .. } => self
+                .current
+                .as_ref()
+                .filter(|binding| matches!(binding.target, LifecycleTarget::Stream { .. })),
+            LifecycleTarget::Validation { .. } => None,
+        }
+    }
+
+    fn has_bindings(&self) -> bool {
+        self.root.is_some() || self.current.is_some()
+    }
+
+    fn tracked_targets(&self) -> usize {
+        self.retired.len() + usize::from(self.root.is_some()) + usize::from(self.current.is_some())
+    }
+
+    fn migrate_legacy_root(&mut self) -> Result<(), &'static str> {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|binding| matches!(binding.target, LifecycleTarget::Session { .. }))
+        {
+            if self.root.is_some() {
+                return Err("invalid_ownership_journal");
+            }
+            self.root = self.current.take();
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -35,6 +85,19 @@ pub(crate) struct Change {
     pub expected_revision: Option<String>,
     pub new_revision: Option<String>,
     generation: u64,
+}
+
+impl Change {
+    pub(crate) fn policy_key(&self) -> Result<String, &'static str> {
+        if session_key(&self.target)? != self.session {
+            return Err("invalid_identity");
+        }
+        match &self.target {
+            LifecycleTarget::Session { .. } => Ok(self.session.clone()),
+            LifecycleTarget::Stream { .. } => Ok(format!("stream-{}", target_key(&self.target)?)),
+            LifecycleTarget::Validation { .. } => Err("invalid_target"),
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -51,7 +114,7 @@ fn hash(value: &impl serde::Serialize) -> Result<String, &'static str> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn session_key(target: &LifecycleTarget) -> Result<String, &'static str> {
+pub(crate) fn session_key(target: &LifecycleTarget) -> Result<String, &'static str> {
     let (epoch, session) = match target {
         LifecycleTarget::Session {
             host_epoch,
@@ -76,6 +139,12 @@ fn target_key(target: &LifecycleTarget) -> Result<String, &'static str> {
 }
 
 impl Ownership {
+    pub(crate) fn has_root(&self, session: &str) -> bool {
+        self.sessions
+            .get(session)
+            .is_some_and(|entry| entry.root().is_some())
+    }
+
     pub(crate) fn remember_retired_target(
         &mut self,
         target: &LifecycleTarget,
@@ -89,7 +158,7 @@ impl Ownership {
         }
         let target = target_key(target)?;
         let entry = self.sessions.entry(key).or_default();
-        if !entry.retired.contains(&target) && entry.retired.len() >= MAX_RETIRED_TARGETS {
+        if !entry.retired.contains(&target) && entry.tracked_targets() >= MAX_RETIRED_TARGETS {
             return Err("retirement_capacity_exhausted");
         }
         entry.retired.insert(target);
@@ -115,18 +184,38 @@ impl Ownership {
         for (key, session) in &self.sessions {
             if !valid_session(key)
                 || self.completed.contains_key(key)
-                || session.retired.len() > MAX_RETIRED_TARGETS
+                || session.tracked_targets() > MAX_RETIRED_TARGETS
                 || session.retired.iter().any(|value| !valid_hash(value))
+                || (session.root.is_some()
+                    && session.current.as_ref().is_some_and(|binding| {
+                        matches!(binding.target, LifecycleTarget::Session { .. })
+                    }))
             {
                 return Err("invalid_ownership_journal");
             }
-            if let Some(current) = &session.current
-                && (session_key(&current.target)? != *key
-                    || current
+            for binding in session.root.iter().chain(session.current.iter()) {
+                if session_key(&binding.target)? != *key
+                    || binding
                         .revision
                         .strip_prefix("revision-")
                         .is_none_or(|value| !valid_hash(value))
-                    || session.retired.contains(&target_key(&current.target)?))
+                    || session.retired.contains(&target_key(&binding.target)?)
+                {
+                    return Err("invalid_ownership_journal");
+                }
+            }
+            if session
+                .root
+                .as_ref()
+                .is_some_and(|binding| !matches!(binding.target, LifecycleTarget::Session { .. }))
+            {
+                return Err("invalid_ownership_journal");
+            }
+            if let Some(target) = &session.retiring_root
+                && (!matches!(target, LifecycleTarget::Session { .. })
+                    || session_key(target)? != *key
+                    || !session.retired.contains(&target_key(target)?)
+                    || session.root().is_some())
             {
                 return Err("invalid_ownership_journal");
             }
@@ -142,8 +231,11 @@ impl Ownership {
             let current = self.sessions.get(&pending.session);
             if session_key(&pending.target)? != pending.session
                 || current.map_or(0, |entry| entry.generation) != pending.generation
-                || current.and_then(|entry| entry.current.as_ref().map(|entry| &entry.revision))
-                    != pending.expected_revision.as_ref()
+                || current.and_then(|entry| {
+                    entry
+                        .binding(&pending.target)
+                        .map(|binding| &binding.revision)
+                }) != pending.expected_revision.as_ref()
                 || pending.new_revision.as_deref().is_some_and(|revision| {
                     revision
                         .strip_prefix("revision-")
@@ -156,8 +248,8 @@ impl Ownership {
         Ok(())
     }
 
-    /// Called only after a replacement worker proves the prior owner's policy
-    /// file absent. Remember targets for cleanup, without reviving their effects.
+    /// Called only after the replacement worker proves all prior owned policy
+    /// entries absent. Preserve exact root/stream targets without replaying them.
     pub(crate) fn retire_after_worker_restart(&mut self) -> Result<(), &'static str> {
         let mut retired = self.clone();
         if let Some(change) = retired.pending.take() {
@@ -165,7 +257,12 @@ impl Ownership {
             entry.retired.insert(target_key(&change.target)?);
         }
         for session in retired.sessions.values_mut() {
-            if let Some(binding) = session.current.take() {
+            for binding in session
+                .root
+                .take()
+                .into_iter()
+                .chain(session.current.take())
+            {
                 session.retired.insert(target_key(&binding.target)?);
             }
             if session.retired.len() > MAX_RETIRED_TARGETS {
@@ -189,14 +286,12 @@ impl Ownership {
             || self.sessions.get(&session).is_some_and(|entry| {
                 entry.retired.contains(&target_id)
                     || entry
-                        .current
-                        .as_ref()
+                        .binding(target)
                         .is_some_and(|binding| binding.target == *target)
             })
     }
 
-    /// Reserve no effect: callers send this exact expected revision to the
-    /// worker and call `commit` only after the matching successful reply.
+    /// Reserve one exact slot; its sibling root/stream entry remains independent.
     pub(crate) fn prepare(
         &mut self,
         target: &LifecycleTarget,
@@ -219,41 +314,42 @@ impl Ownership {
         if existing.is_none() && self.sessions.len() >= MAX_SESSIONS {
             return Err("session_capacity_exhausted");
         }
-        if existing.is_some_and(|value| value.generation == u64::MAX) {
+        if existing.is_some_and(|entry| entry.retiring_root.is_some()) {
+            return Err("retired_session");
+        }
+        if existing.is_some_and(|entry| entry.generation == u64::MAX) {
             return Err("ownership_generation_exhausted");
         }
         let target_id = target_key(target)?;
-        if existing.is_some_and(|value| value.retired.contains(&target_id)) {
+        if existing.is_some_and(|entry| entry.retired.contains(&target_id)) {
             return Err("retired_target");
         }
-        if let Some(current) = existing.and_then(|value| value.current.as_ref()) {
-            if current.target != *target && matches!(current.target, LifecycleTarget::Stream { .. })
-            {
-                return Err("previous_stream_not_retired");
-            }
-            if current.target != *target
-                && existing.is_some_and(|value| value.retired.len() >= MAX_RETIRED_TARGETS)
-            {
-                return Err("retirement_capacity_exhausted");
-            }
+        let binding = existing.and_then(|entry| entry.binding(target));
+        if let Some(binding) = binding
+            && binding.target != *target
+        {
+            return Err(match target {
+                LifecycleTarget::Stream { .. } => "previous_stream_not_retired",
+                _ => "previous_session_not_retired",
+            });
+        }
+        if binding.is_none()
+            && existing.is_some_and(|entry| entry.tracked_targets() >= MAX_RETIRED_TARGETS)
+        {
+            return Err("retirement_capacity_exhausted");
         }
         let change = Change {
             session,
             target: target.clone(),
-            expected_revision: existing.and_then(|value| {
-                value
-                    .current
-                    .as_ref()
-                    .map(|binding| binding.revision.clone())
-            }),
+            expected_revision: binding.map(|binding| binding.revision.clone()),
             new_revision: Some(format!("revision-{}", hash(&(target, transition))?)),
-            generation: existing.map_or(0, |value| value.generation),
+            generation: existing.map_or(0, |entry| entry.generation),
         };
         self.pending = Some(change.clone());
         Ok(change)
     }
 
-    /// A missing target is unknown, not proof that a previous effect was removed.
+    /// Unknown targets never authorize cleanup of either live slot.
     pub(crate) fn release(
         &mut self,
         target: &LifecycleTarget,
@@ -266,11 +362,26 @@ impl Ownership {
         if self.completed.get(&session) == Some(&target_id) {
             return Ok(None);
         }
-        let entry = self.sessions.get(&session).ok_or("ownership_unknown")?;
+        let entry = self.sessions.get_mut(&session).ok_or("ownership_unknown")?;
         if entry.retired.contains(&target_id) {
+            if matches!(target, LifecycleTarget::Session { .. }) {
+                if entry.root().is_some()
+                    || entry
+                        .retiring_root
+                        .as_ref()
+                        .is_some_and(|root| root != target)
+                {
+                    return Err("target_not_current");
+                }
+                entry.retiring_root = Some(target.clone());
+            }
             return Ok(None);
         }
-        let current = entry.current.as_ref().ok_or("ownership_unknown")?;
+        let current = entry.binding(target).ok_or(if entry.has_bindings() {
+            "target_not_current"
+        } else {
+            "ownership_unknown"
+        })?;
         if current.target != *target {
             return Err("target_not_current");
         }
@@ -297,8 +408,11 @@ impl Ownership {
         }
         let existing = self.sessions.get(&change.session);
         if existing.map_or(0, |entry| entry.generation) != change.generation
-            || existing.and_then(|entry| entry.current.as_ref().map(|binding| &binding.revision))
-                != change.expected_revision.as_ref()
+            || existing.and_then(|entry| {
+                entry
+                    .binding(&change.target)
+                    .map(|binding| &binding.revision)
+            }) != change.expected_revision.as_ref()
         {
             return Err("ownership_changed");
         }
@@ -310,7 +424,13 @@ impl Ownership {
             return Err("session_capacity_exhausted");
         }
         let entry = self.sessions.entry(change.session).or_default();
-        if let Some(current) = &entry.current
+        entry.migrate_legacy_root()?;
+        let slot = match change.target {
+            LifecycleTarget::Session { .. } => &mut entry.root,
+            LifecycleTarget::Stream { .. } => &mut entry.current,
+            LifecycleTarget::Validation { .. } => return Err("invalid_target"),
+        };
+        if let Some(current) = slot.as_ref()
             && (current.target != change.target || change.new_revision.is_none())
         {
             if entry.retired.len() >= MAX_RETIRED_TARGETS {
@@ -318,7 +438,11 @@ impl Ownership {
             }
             entry.retired.insert(target_key(&current.target)?);
         }
-        entry.current = change.new_revision.map(|revision| Binding {
+        if change.new_revision.is_none() && matches!(change.target, LifecycleTarget::Session { .. })
+        {
+            entry.retiring_root = Some(change.target.clone());
+        }
+        *slot = change.new_revision.map(|revision| Binding {
             target: change.target,
             revision,
         });
@@ -336,8 +460,31 @@ impl Ownership {
         Ok(())
     }
 
-    /// Retire an ended session only after its last worker effect is confirmed
-    /// absent. Keep bounded tombstones so repeated cleanup remains idempotent.
+    /// Finish either cleanup order once the root release was acknowledged and
+    /// both independent native entries have gone. A paused root stays live.
+    pub(crate) fn finish_session_if_idle(
+        &mut self,
+        target: &LifecycleTarget,
+    ) -> Result<bool, &'static str> {
+        if self.pending.is_some() {
+            return Err("ownership_change_pending");
+        }
+        let key = session_key(target)?;
+        if self.completed.contains_key(&key) {
+            return Ok(true);
+        }
+        let entry = self.sessions.get(&key).ok_or("ownership_unknown")?;
+        if entry.has_bindings() {
+            return Ok(false);
+        }
+        let Some(root) = entry.retiring_root.clone() else {
+            return Ok(false);
+        };
+        self.finish_session(&root)?;
+        Ok(true)
+    }
+
+    /// Strict completion requires exact root retirement and no surviving stream.
     pub(crate) fn finish_session(&mut self, target: &LifecycleTarget) -> Result<(), &'static str> {
         if self.pending.is_some() {
             return Err("ownership_change_pending");
@@ -351,7 +498,13 @@ impl Ownership {
             return Ok(());
         }
         let entry = self.sessions.get(&key).ok_or("ownership_unknown")?;
-        if entry.current.is_some() || !entry.retired.contains(&target_id) {
+        if entry.has_bindings()
+            || !entry.retired.contains(&target_id)
+            || entry
+                .retiring_root
+                .as_ref()
+                .is_some_and(|root| root != target)
+        {
             return Err("session_not_retired");
         }
         self.sessions.remove(&key);
@@ -397,7 +550,8 @@ mod tests {
         let second = owner.prepare(&stream("second"), "start-second").unwrap();
         owner.commit(second).unwrap();
         assert!(owner.release(&stream("first")).unwrap().is_none());
-        assert!(owner.release(&session()).unwrap().is_none());
+        let root_release = owner.release(&session()).unwrap().unwrap();
+        owner.commit(root_release).unwrap();
         assert_eq!(owner.release(&stream("unknown")), Err("target_not_current"));
         let current = owner.release(&stream("second")).unwrap().unwrap();
         owner.commit(current).unwrap();
@@ -442,5 +596,201 @@ mod tests {
         );
         assert_eq!(owner.release(&session()), Err("target_not_current"));
         assert_eq!(owner.finish_session(&session()), Err("session_not_retired"));
+    }
+    #[test]
+    fn pausing_and_resuming_preserves_the_exact_root_claim() {
+        let mut owner = Ownership::default();
+        let root = owner.prepare(&session(), "prepare-root").unwrap();
+        let root_key = root.policy_key().unwrap();
+        let root_revision = root.new_revision.clone();
+        assert_eq!(root_key, session_key(&session()).unwrap());
+        assert!(root_key.len() <= 128);
+        owner.commit(root).unwrap();
+        let first = owner.prepare(&stream("first"), "prepare-first").unwrap();
+        let first_key = first.policy_key().unwrap();
+        assert!(first_key.starts_with("stream-"));
+        assert!(first_key.len() <= 128);
+        assert_ne!(first_key, root_key);
+        owner.commit(first).unwrap();
+        let pause = owner.release(&stream("first")).unwrap().unwrap();
+        owner.commit(pause).unwrap();
+        assert!(owner.has_root(&root_key));
+        assert!(!owner.finish_session_if_idle(&stream("first")).unwrap());
+        let resumed = owner.prepare(&stream("resumed"), "resume").unwrap();
+        assert_eq!(resumed.expected_revision, None);
+        assert_ne!(resumed.policy_key().unwrap(), first_key);
+        let resumed_revision = resumed.new_revision.clone();
+        owner.commit(resumed).unwrap();
+        assert!(owner.release(&stream("first")).unwrap().is_none());
+        let root_release = owner.release(&session()).unwrap().unwrap();
+        assert_eq!(root_release.expected_revision, root_revision);
+        owner.abort(&root_release).unwrap();
+        let resumed_release = owner.release(&stream("resumed")).unwrap().unwrap();
+        assert_eq!(resumed_release.expected_revision, resumed_revision);
+        owner.abort(&resumed_release).unwrap();
+        owner.validate().unwrap();
+    }
+
+    #[test]
+    fn final_cleanup_finishes_only_after_both_independent_claims_retire() {
+        for root_first in [true, false] {
+            let mut owner = Ownership::default();
+            let root = owner.prepare(&session(), "root").unwrap();
+            owner.commit(root).unwrap();
+            let active_stream = stream("active");
+            let claim = owner.prepare(&active_stream, "stream").unwrap();
+            owner.commit(claim).unwrap();
+            let (first, last) = if root_first {
+                (session(), active_stream.clone())
+            } else {
+                (active_stream.clone(), session())
+            };
+            let release = owner.release(&first).unwrap().unwrap();
+            owner.commit(release).unwrap();
+            assert!(!owner.finish_session_if_idle(&first).unwrap());
+            assert_eq!(
+                owner.has_root(&session_key(&session()).unwrap()),
+                !root_first
+            );
+            if root_first {
+                assert_eq!(
+                    owner.prepare(&stream("late"), "late"),
+                    Err("retired_session")
+                );
+            }
+            let mut restored: Ownership =
+                serde_json::from_value(serde_json::to_value(&owner).unwrap()).unwrap();
+            restored.validate().unwrap();
+            let release = restored.release(&last).unwrap().unwrap();
+            restored.commit(release).unwrap();
+            assert!(restored.finish_session_if_idle(&last).unwrap());
+            assert!(restored.finish_session_if_idle(&first).unwrap());
+            assert!(restored.sessions.is_empty());
+            assert_eq!(restored.completed.len(), 1);
+            assert_eq!(restored.prepare(&session(), "late"), Err("retired_session"));
+            restored.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn verified_worker_retirement_remembers_both_claims_without_replaying_them() {
+        let mut owner = Ownership::default();
+        let root = owner.prepare(&session(), "root").unwrap();
+        owner.commit(root).unwrap();
+        let active = stream("active");
+        let claim = owner.prepare(&active, "stream").unwrap();
+        owner.commit(claim).unwrap();
+        let pending = owner.prepare(&active, "uncertain-update").unwrap();
+        let mut restored: Ownership =
+            serde_json::from_value(serde_json::to_value(&owner).unwrap()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(
+            restored.release(&session()),
+            Err("ownership_change_pending")
+        );
+        restored.retire_after_worker_restart().unwrap();
+        assert_eq!(
+            restored.commit(pending),
+            Err("ownership_change_not_reserved")
+        );
+        assert!(!restored.has_root(&session_key(&session()).unwrap()));
+        assert!(restored.knows_target(&session()));
+        assert!(restored.knows_target(&active));
+        assert!(!restored.finish_session_if_idle(&active).unwrap());
+        assert!(restored.release(&session()).unwrap().is_none());
+        assert!(restored.finish_session_if_idle(&session()).unwrap());
+        restored.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_journal_keeps_only_its_exact_binding_until_verified_retirement() {
+        for original in [session(), stream("legacy")] {
+            let key = session_key(&original).unwrap();
+            let journal = serde_json::json!({
+                "sessions": {key.clone(): {
+                    "current": {"target": original, "revision": format!("revision-{}", "a".repeat(64))},
+                    "retired": [], "generation": 1
+                }},
+                "completed": {}, "completion_order": [], "pending": null
+            });
+            let mut owner: Ownership = serde_json::from_value(journal).unwrap();
+            owner.validate().unwrap();
+            assert_eq!(
+                owner.has_root(&key),
+                matches!(original, LifecycleTarget::Session { .. })
+            );
+            owner.retire_after_worker_restart().unwrap();
+            assert!(!owner.has_root(&key));
+            assert!(owner.knows_target(&original));
+            assert_eq!(owner.knows_target(&session()), original == session());
+            assert!(owner.sessions[&key].root.is_none());
+            assert!(owner.sessions[&key].current.is_none());
+            owner.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn retired_root_hash_is_never_reconstructed_as_a_live_root() {
+        let mut owner = Ownership::default();
+        owner.remember_retired_target(&session()).unwrap();
+        let active = stream("legacy-stream");
+        let claim = owner.prepare(&active, "stream").unwrap();
+        owner.commit(claim).unwrap();
+        let key = session_key(&session()).unwrap();
+        assert!(!owner.has_root(&key));
+        assert!(owner.release(&session()).unwrap().is_none());
+        assert!(!owner.finish_session_if_idle(&session()).unwrap());
+        let release = owner.release(&active).unwrap().unwrap();
+        owner.commit(release).unwrap();
+        assert!(owner.finish_session_if_idle(&active).unwrap());
+        owner.validate().unwrap();
+    }
+
+    #[test]
+    fn independent_slots_reserve_bounded_retirement_storage() {
+        let mut owner = Ownership::default();
+        let root = owner.prepare(&session(), "root").unwrap();
+        owner.commit(root).unwrap();
+        for index in 0..(MAX_RETIRED_TARGETS - 1) {
+            owner
+                .remember_retired_target(&stream(&format!("retired-{index}")))
+                .unwrap();
+        }
+        assert_eq!(
+            owner.prepare(&stream("overflow"), "stream"),
+            Err("retirement_capacity_exhausted")
+        );
+        assert_eq!(
+            owner.remember_retired_target(&stream("overflow")),
+            Err("retirement_capacity_exhausted")
+        );
+        let release = owner.release(&session()).unwrap().unwrap();
+        owner.commit(release).unwrap();
+        assert!(owner.finish_session_if_idle(&session()).unwrap());
+        owner.validate().unwrap();
+    }
+
+    #[test]
+    fn session_root_and_stream_claim_keep_independent_native_revisions() {
+        let mut owner = Ownership::default();
+        let root = owner.prepare(&session(), "prepare-root").unwrap();
+        let root_revision = root.new_revision.clone();
+        owner.commit(root).unwrap();
+        let stream_change = owner.prepare(&stream("first"), "prepare-stream").unwrap();
+        assert_eq!(
+            stream_change.expected_revision, None,
+            "a new stream is a distinct worker policy entry"
+        );
+        let stream_revision = stream_change.new_revision.clone();
+        owner.commit(stream_change).unwrap();
+        let release_root = owner
+            .release(&session())
+            .unwrap()
+            .expect("stream preparation must preserve the session root");
+        assert_eq!(release_root.expected_revision, root_revision);
+        owner.commit(release_root).unwrap();
+        let release_stream = owner.release(&stream("first")).unwrap().unwrap();
+        assert_eq!(release_stream.expected_revision, stream_revision);
+        owner.commit(release_stream).unwrap();
     }
 }

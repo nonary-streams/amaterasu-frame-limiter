@@ -55,17 +55,156 @@ fn shutdown_announcement_preserves_consumer_callbacks_and_closes_legacy_admissio
             .is_ok()
     );
     let (request, policy) = callback(&worker, crate::windows_policy::Provider::Auto);
+    assert!(!worker.has_receipt(&request));
     assert!(!worker.owns_target(&request.target));
     assert!(matches!(
         worker.begin(&request, Some(policy.clone()), 5_000),
         ProviderResponse::Pending { .. }
     ));
     assert_ne!(worker.quiesce(), Ok(true));
+    assert!(worker.has_receipt(&request));
+    let mut foreign = request.clone();
+    foreign.operation_id.push_str("-foreign");
+    assert!(!worker.has_receipt(&foreign));
     let id = worker.receipts[&receipt_id(&request)];
     assert!(matches!(
         serde_json::from_value::<ProviderResponse>(worker.result(id).unwrap()).unwrap(),
         ProviderResponse::Rejected { .. }
     ));
+}
+
+#[test]
+fn admitted_snapshot_policy_and_cached_receipt_survive_root_retirement() {
+    let mut worker = Worker::new(PathBuf::from("unused-rtss.json"));
+    let session: api::LifecycleTarget = serde_json::from_value(
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+    )
+    .unwrap();
+    let root_id = crate::windows_lifecycle::target_identity(&session)
+        .unwrap()
+        .1;
+    let frozen = Policy {
+        provider: crate::windows_policy::Provider::Rtss,
+        installation: String::new(),
+        profile: crate::rtss::GLOBAL_PROFILE.into(),
+        values: crate::lease::ProfileValues {
+            frame_limit: 60,
+            frame_limit_denominator: 1,
+            sync_limiter: 0,
+        },
+        driver_limit_millihz: Some(60000),
+        disable_vsync: false,
+        smooth_motion: false,
+    };
+    let root = crate::windows_lifecycle::ownership::Root {
+        target: session,
+        policy: frozen.clone(),
+        rtss_lease: Some("owned-lease".into()),
+        driver: false,
+        application: true,
+        streams: Default::default(),
+        releasing: Default::default(),
+        retired_streams: Default::default(),
+        phase: crate::windows_lifecycle::ownership::Phase::Active,
+    };
+    worker.snapshot = Some(Snapshot {
+        revision: 2,
+        targets: vec![root_id],
+        root: Some(root.clone()),
+    });
+    validate_snapshot(worker.snapshot.as_ref().unwrap()).unwrap();
+    let (mut request, mut changed) = callback(&worker, crate::windows_policy::Provider::Nvidia);
+    request.target = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1})).unwrap();
+    request.phase = api::LifecyclePhase::StreamPrepare;
+    request.operation = api::ProviderOperation::ResourcePlan;
+    request.approved_plan = None;
+    request.admission_id = None;
+    request.plan_revision = None;
+    changed.values.frame_limit = 90;
+    changed.driver_limit_millihz = Some(90000);
+    let plan = worker.plan(&request, Some(&changed)).unwrap();
+    assert_eq!(
+        plan.constraints["policy"],
+        serde_json::to_value(&frozen).unwrap()
+    );
+    request.operation = api::ProviderOperation::LifecycleCallback;
+    request.plan_revision = Some(plan.revision);
+    request.admission_id = Some("admitted".into());
+    request.approved_plan = Some(plan);
+    assert!(matches!(
+        worker.begin(&request, Some(changed.clone()), 5_000),
+        ProviderResponse::Pending { .. }
+    ));
+    let id = worker.receipts[&receipt_id(&request)];
+    worker.finish(id, json!({"status":"prepared","candidate":null,"obligations":request.approved_plan.as_ref().unwrap().obligations,"outputs":[]}));
+    worker.snapshot.as_mut().unwrap().root = None;
+    assert!(matches!(
+        worker.begin(&request, Some(changed), 5_000),
+        ProviderResponse::Prepared { .. }
+    ));
+    let mut release = request.clone();
+    release.phase = api::LifecyclePhase::StreamRelease;
+    release.operation = api::ProviderOperation::ResourcePlan;
+    release.operation_id = "release".into();
+    release.approved_plan = None;
+    release.admission_id = None;
+    release.plan_revision = None;
+    let plan = worker.plan(&release, None).unwrap();
+    release.operation = api::ProviderOperation::LifecycleCallback;
+    release.plan_revision = Some(plan.revision);
+    release.admission_id = Some("release-admitted".into());
+    release.approved_plan = Some(plan);
+    assert!(
+        matches!(
+            worker.begin(&release, None, 5_000),
+            ProviderResponse::Pending { .. }
+        ),
+        "cleanup does not require a prepare policy argument"
+    );
+    let mut invalid = worker.snapshot.clone().unwrap();
+    invalid.root = Some(crate::windows_lifecycle::ownership::Root {
+        target: request.target.clone(),
+        policy: frozen,
+        rtss_lease: None,
+        driver: false,
+        application: true,
+        streams: Default::default(),
+        releasing: Default::default(),
+        retired_streams: Default::default(),
+        phase: crate::windows_lifecycle::ownership::Phase::Active,
+    });
+    assert!(validate_snapshot(&invalid).is_err());
+    let mut oversized = root.clone();
+    oversized.policy.installation = "x".repeat(4096);
+    assert!(crate::windows_lifecycle::ownership::validate_root(&oversized).is_err());
+    let mut too_many = root;
+    for index in 0..33 {
+        let target: api::LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":format!("stream-{index}"),"generation":1})).unwrap();
+        too_many.streams.insert(
+            crate::windows_lifecycle::target_identity(&target)
+                .unwrap()
+                .1,
+        );
+    }
+    assert!(crate::windows_lifecycle::ownership::validate_root(&too_many).is_err());
+}
+
+#[test]
+fn new_callback_rejects_policy_that_differs_from_its_admitted_plan() {
+    let mut worker = Worker::new(PathBuf::from("unused-rtss.json"));
+    worker.snapshot = Some(Snapshot {
+        revision: 2,
+        targets: vec![],
+        root: None,
+    });
+    let (mut request, policy) = callback(&worker, crate::windows_policy::Provider::Rtss);
+    request.approved_plan.as_mut().unwrap().constraints["policy"]["values"]["frame_limit"] =
+        json!(144);
+    assert!(matches!(
+        worker.begin(&request, Some(policy), 5_000),
+        ProviderResponse::Rejected { .. }
+    ));
+    assert!(worker.jobs.is_empty());
 }
 
 #[cfg(not(windows))]

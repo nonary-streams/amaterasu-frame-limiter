@@ -161,6 +161,22 @@ NVIDIA call returns recovery-required rather than attempting another backend.
 
 ## Policy behavior
 
+An admitted application/session policy is a frozen ownership root. Stream
+preparation borrows that exact policy, including provider and overlay choices;
+a resumed or joining client's settings cannot reinterpret it. Pausing releases
+only the exact stream claim. The application root retains its policy until
+session release, and a surviving stream retains it if session cleanup arrives
+first. Native restoration happens after the final owner releases. Delayed old
+stream cleanup cannot remove a resumed stream's claim.
+
+Linux persists independent root and stream revisions and publishes identical
+frozen policies under separate worker entries, sharing the same 32-entry bound.
+Windows keeps one native RTSS/NVCP lease under the exact session root and stores
+the frozen policy and stream claims in the existing RTSS journal, including for
+driver-only policies. A prior stream-only policy without an admitted session
+root keeps its original stream scope; cleanup does not invent application
+ownership from a group ID or retired target. Disabled settings remain inert.
+
 On 64-bit Windows the NVIDIA backend uses the system NVAPI DRS interface. It
 records the selected profile's name, setting values and override provenance
 before saving changes. Explicit NVIDIA selection bypasses RTSS. Auto may fall

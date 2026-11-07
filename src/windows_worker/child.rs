@@ -52,7 +52,11 @@ fn write(reply: &Reply) -> Result<(), &'static str> {
 }
 fn snapshot(backend: &Backend<RtssProvider>) -> Result<Snapshot, &'static str> {
     let (revision, targets) = backend.snapshot()?;
-    Ok(Snapshot { revision, targets })
+    Ok(Snapshot {
+        revision,
+        targets,
+        root: backend.snapshot_root()?,
+    })
 }
 
 fn run() -> Result<(), &'static str> {

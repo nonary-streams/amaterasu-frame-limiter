@@ -102,7 +102,18 @@ impl Backend {
         if self.failed {
             return Err("worker_recovery_required");
         }
+        let inherited = self.inherited_policy(&request.target);
+        let policy = if preparing(request) {
+            inherited.as_ref().or(policy)
+        } else {
+            policy
+        };
         crate::lifecycle_plan::build(request, policy, self.state.revision)
+    }
+
+    pub(crate) fn inherited_policy(&self, target: &api::LifecycleTarget) -> Option<Value> {
+        let key = crate::linux_ownership::session_key(target).ok()?;
+        self.state.root_policies.get(&key).cloned()
     }
 
     pub(crate) fn mangohud_available(&self) -> bool {
@@ -246,21 +257,44 @@ impl Backend {
         let reject = |reason: &str| ProviderResponse::Rejected {
             reason: reason.into(),
         };
+        if api::validate_provider_request(request).is_err()
+            || request.operation != api::ProviderOperation::LifecycleCallback
+        {
+            return reject("invalid_request");
+        }
+        if let Err(reason) = self.initialize() {
+            return reject(reason);
+        }
+        let receipt = receipt_id(request);
+        let policy = if preparing(request) {
+            if self.state.receipts.contains_key(&receipt) {
+                // A retained receipt binds the whole admitted plan and policy
+                // fingerprint. Its immutable projection survives a sibling
+                // root release; current settings cannot reinterpret that retry.
+                request
+                    .approved_plan
+                    .as_ref()
+                    .and_then(|plan| plan.constraints.get("policy"))
+                    .filter(|policy| !policy.is_null())
+                    .cloned()
+                    .or(policy)
+            } else {
+                self.inherited_policy(&request.target).or(policy)
+            }
+        } else {
+            policy
+        };
         if let Err(reason) = validate_admission(request, policy.as_ref()) {
             return reject(reason);
         }
         if remaining_ms == 0 {
             return reject("callback_expired_before_effect");
         }
-        if let Err(reason) = self.initialize() {
-            return reject(reason);
-        }
         if self.failed && !self.recovering {
             return ProviderResponse::RecoveryRequired {
                 reason: "worker_recovery_required".into(),
             };
         }
-        let receipt = receipt_id(request);
         if let Some(record) = self.state.receipts.get(&receipt) {
             if !record.matches(request, &policy) {
                 return reject("operation_identity_conflict");
@@ -354,6 +388,10 @@ impl Backend {
                 reason: "unknown_receipt".into(),
             },
         }
+    }
+
+    pub(crate) fn has_receipt(&self, request: &ProviderRequest) -> bool {
+        self.state.receipts.contains_key(&receipt_id(request))
     }
 
     pub(crate) fn advance(&mut self) {
@@ -601,15 +639,24 @@ impl Backend {
                     .pending_policies
                     .take()
                     .ok_or("missing_policy_intent")?;
+                if matches!(record.request.target, api::LifecycleTarget::Session { .. }) {
+                    if let Some(policy) = &record.policy {
+                        self.state
+                            .root_policies
+                            .insert(change.session.clone(), policy.clone());
+                    } else {
+                        self.state.root_policies.remove(&change.session);
+                    }
+                }
                 self.state.revision = self
                     .state
                     .revision
                     .checked_add(1)
                     .ok_or("provider_revision_exhausted")?;
-                if record.request.phase == LifecyclePhase::SessionRelease {
+                if !preparing(&record.request) {
                     self.state
                         .ownership
-                        .finish_session(&record.request.target)?;
+                        .finish_session_if_idle(&record.request.target)?;
                 }
                 self.checkpoint()?;
                 return Ok(Some(success(&record.request)));
@@ -631,7 +678,7 @@ impl Backend {
                 Ok(change) => change,
                 Err(reason) => return Ok(Some(rejected(reason))),
             };
-            let command = json!({"operation":"set","session":change.session,
+            let command = json!({"operation":"set","session":change.policy_key()?,
                 "expected_revision":change.expected_revision,"revision":change.new_revision,"policy":policy});
             (change, command)
         } else {
@@ -640,21 +687,28 @@ impl Backend {
                 Err(reason) => return Ok(Some(rejected(reason))),
             };
             let Some(change) = release else {
-                if record.request.phase == LifecyclePhase::SessionRelease
-                    && let Err(reason) = self.state.ownership.finish_session(&record.request.target)
+                if let Err(reason) = self
+                    .state
+                    .ownership
+                    .finish_session_if_idle(&record.request.target)
                 {
                     return Ok(Some(rejected(reason)));
                 }
                 return Ok(Some(success(&record.request)));
             };
-            let command = json!({"operation":"remove","session":change.session,"expected_revision":change.expected_revision});
+            let command = json!({"operation":"remove","session":change.policy_key()?,"expected_revision":change.expected_revision});
             (change, command)
         };
         let mut expected = self.state.worker_policies.clone();
+        let policy_key = change.0.policy_key()?;
         if let Some(policy) = &record.policy {
-            expected.insert(change.0.session.clone(), policy.clone());
+            expected.insert(policy_key.clone(), policy.clone());
         } else {
-            expected.remove(&change.0.session);
+            expected.remove(&policy_key);
+        }
+        if expected.len() > 32 {
+            self.state.ownership.abort(&change.0)?;
+            return Ok(Some(rejected("policy_capacity_exhausted")));
         }
         self.state.pending_policies = Some(expected);
         self.checkpoint()?;
@@ -700,6 +754,13 @@ impl Backend {
         }
         Ok(Some(reply))
     }
+}
+
+fn preparing(request: &ProviderRequest) -> bool {
+    matches!(
+        request.phase,
+        LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+    )
 }
 
 fn rejected(reason: &str) -> ProviderResponse {
@@ -1036,9 +1097,9 @@ mod tests {
     #[test]
     fn restart_confirms_pending_cleanup_only_after_owned_policy_is_absent() {
         let mut fixture = Fixture::new();
-        let policy = policy(60000);
-        let prepare = request(&fixture.backend, 1, None, false, Some(&policy));
-        fixture.run(&prepare, Some(policy));
+        let original = policy(60000);
+        let prepare = request(&fixture.backend, 1, None, false, Some(&original));
+        fixture.run(&prepare, Some(original));
         let release = request(&fixture.backend, 2, None, true, None);
         fixture.backend.begin(&release, None);
         fixture.wait_for_effect();
@@ -1053,6 +1114,19 @@ mod tests {
             fixture.backend.begin(&release, None),
             ProviderResponse::Cleanup { .. }
         ));
+        let late_policy = policy(120000);
+        let late = request(
+            &fixture.backend,
+            3,
+            Some("after-end"),
+            false,
+            Some(&late_policy),
+        );
+        assert_eq!(
+            fixture.run(&late, Some(late_policy)),
+            rejected("retired_session")
+        );
+        assert!(fixture.policies().is_empty());
     }
 
     #[test]
@@ -1161,7 +1235,7 @@ mod tests {
         ));
         let stream = request(&fixture.backend, 2, Some("first"), false, Some(&first));
         assert!(matches!(
-            fixture.run(&stream, Some(first)),
+            fixture.run(&stream, Some(first.clone())),
             ProviderResponse::Prepared { .. }
         ));
         let stop = request(&fixture.backend, 3, Some("first"), true, None);
@@ -1169,7 +1243,7 @@ mod tests {
             fixture.run(&stop, None),
             ProviderResponse::Cleanup { .. }
         ));
-        assert!(fixture.policies().is_empty());
+        assert_eq!(fixture.policies(), vec![first.clone()]);
         let resumed = policy(120000);
         let resume = request(&fixture.backend, 4, Some("resumed"), false, Some(&resumed));
         assert!(matches!(
@@ -1181,7 +1255,7 @@ mod tests {
             fixture.run(&late, None),
             ProviderResponse::Cleanup { .. }
         ));
-        assert_eq!(fixture.policies(), vec![resumed]);
+        assert_eq!(fixture.policies(), vec![first.clone(), first]);
         let stop = request(&fixture.backend, 6, Some("resumed"), true, None);
         assert!(matches!(
             fixture.run(&stop, None),
@@ -1193,6 +1267,175 @@ mod tests {
             ProviderResponse::Cleanup { .. }
         ));
         assert!(fixture.policies().is_empty());
+    }
+
+    #[test]
+    fn paused_application_retains_original_policy_for_fresh_proton_launches() {
+        for session_first in [false, true] {
+            let mut fixture = Fixture::new();
+            let mut root_policy = policy(59940);
+            root_policy["provider"] = json!("proton");
+            let prepare = request(&fixture.backend, 1, None, false, Some(&root_policy));
+            assert!(matches!(
+                fixture.run(&prepare, Some(root_policy.clone())),
+                ProviderResponse::Prepared { .. }
+            ));
+            let stream = request(
+                &fixture.backend,
+                2,
+                Some("first"),
+                false,
+                Some(&root_policy),
+            );
+            assert!(matches!(
+                fixture.run(&stream, Some(root_policy.clone())),
+                ProviderResponse::Prepared { .. }
+            ));
+            let mut pause = request(&fixture.backend, 3, Some("first"), true, None);
+            pause.reason = Some(api::ReleaseReason::Pause);
+            assert!(matches!(
+                fixture.run(&pause, None),
+                ProviderResponse::Cleanup { .. }
+            ));
+            let launch = crate::proton_worker::apply_hook_for_test(&fixture.root);
+            assert_eq!(
+                launch["applied"], true,
+                "paused application lost its launch policy"
+            );
+            assert_eq!(launch["environment"]["DXVK_FRAME_RATE"], "60");
+            assert_eq!(launch["environment"]["VKD3D_FRAME_RATE"], "59.94");
+
+            let changed_client = policy(120000);
+            let resume = request(
+                &fixture.backend,
+                4,
+                Some("resumed"),
+                false,
+                Some(&changed_client),
+            );
+            assert_eq!(
+                resume.approved_plan.as_ref().unwrap().constraints["policy"],
+                root_policy
+            );
+            assert_eq!(
+                resume.approved_plan.as_ref().unwrap().constraints["launch_environment"]["contribution"]
+                    ["edits"]["VKD3D_FRAME_RATE"],
+                "59.94"
+            );
+            assert!(matches!(
+                fixture.run(&resume, Some(changed_client.clone())),
+                ProviderResponse::Prepared { .. }
+            ));
+            let late = request(&fixture.backend, 5, Some("first"), true, None);
+            assert!(matches!(
+                fixture.run(&late, None),
+                ProviderResponse::Cleanup { .. }
+            ));
+            let launch = crate::proton_worker::apply_hook_for_test(&fixture.root);
+            assert_eq!(launch["environment"]["VKD3D_FRAME_RATE"], "59.94");
+
+            let (first_target, last_target) = if session_first {
+                (None, Some("resumed"))
+            } else {
+                (Some("resumed"), None)
+            };
+            let mut first_end = request(&fixture.backend, 6, first_target, true, None);
+            first_end.reason = Some(api::ReleaseReason::End);
+            assert!(matches!(
+                fixture.run(&first_end, None),
+                ProviderResponse::Cleanup { .. }
+            ));
+            if session_first {
+                assert!(
+                    matches!(
+                        fixture.backend.begin(&resume, Some(changed_client.clone())),
+                        ProviderResponse::Prepared { .. }
+                    ),
+                    "root release changed an exact stream preparation receipt"
+                );
+            }
+            assert_eq!(
+                crate::proton_worker::apply_hook_for_test(&fixture.root)["environment"]["VKD3D_FRAME_RATE"],
+                "59.94",
+                "one departing owner removed a peer's policy"
+            );
+            let mut last_end = request(&fixture.backend, 7, last_target, true, None);
+            last_end.reason = Some(api::ReleaseReason::End);
+            assert!(matches!(
+                fixture.run(&last_end, None),
+                ProviderResponse::Cleanup { .. }
+            ));
+            assert_eq!(
+                crate::proton_worker::apply_hook_for_test(&fixture.root)["applied"],
+                false
+            );
+            assert!(fixture.policies().is_empty());
+        }
+    }
+
+    #[test]
+    fn root_and_stream_entries_share_capacity_without_retiring_existing_policies() {
+        fn group_request(
+            backend: &Backend,
+            sequence: u64,
+            group: usize,
+            stream: Option<&str>,
+            release: bool,
+            policy: Option<&Value>,
+        ) -> ProviderRequest {
+            let mut request = request(backend, sequence, stream, release, policy);
+            match &mut request.target {
+                api::LifecycleTarget::Session { session_id, .. }
+                | api::LifecycleTarget::Stream { session_id, .. } => {
+                    *session_id = format!("group-{group}");
+                }
+                _ => unreachable!(),
+            }
+            request.operation = api::ProviderOperation::ResourcePlan;
+            request.operation_id = format!("plan-{sequence}");
+            request.plan_revision = None;
+            request.admission_id = None;
+            request.approved_plan = None;
+            let plan = backend.plan(&request, policy).unwrap();
+            request.operation = api::ProviderOperation::LifecycleCallback;
+            request.operation_id = format!("callback-{sequence}");
+            request.plan_revision = Some(plan.revision);
+            request.admission_id = Some(format!("admitted-{sequence}"));
+            request.approved_plan = Some(plan);
+            request
+        }
+
+        let mut fixture = Fixture::new();
+        let first = policy(60000);
+        for group in 0..32 {
+            let prepare = group_request(
+                &fixture.backend,
+                group as u64 + 1,
+                group,
+                None,
+                false,
+                Some(&first),
+            );
+            assert!(matches!(
+                fixture.run(&prepare, Some(first.clone())),
+                ProviderResponse::Prepared { .. }
+            ));
+        }
+        let existing = fixture.policies();
+        assert_eq!(existing.len(), 32);
+        let stream = group_request(&fixture.backend, 33, 0, Some("extra"), false, Some(&first));
+        assert_eq!(
+            fixture.run(&stream, Some(first)),
+            rejected("policy_capacity_exhausted")
+        );
+        assert_eq!(fixture.policies(), existing);
+        assert!(!fixture.backend.failed);
+        let release = group_request(&fixture.backend, 34, 0, None, true, None);
+        assert!(matches!(
+            fixture.run(&release, None),
+            ProviderResponse::Cleanup { .. }
+        ));
+        assert_eq!(fixture.policies().len(), 31);
     }
 
     #[test]
@@ -1427,13 +1670,19 @@ mod tests {
             fixture.run(&stream, Some(first.clone())),
             ProviderResponse::Prepared { .. }
         ));
-        let premature_end = request(&fixture.backend, 4, None, true, None);
-        assert_eq!(
-            fixture.run(&premature_end, None),
-            rejected("session_not_retired")
-        );
+        let root_end = request(&fixture.backend, 4, None, true, None);
+        assert!(matches!(
+            fixture.run(&root_end, None),
+            ProviderResponse::Cleanup { .. }
+        ));
         assert_eq!(fixture.policies(), vec![first]);
         assert!(!fixture.backend.failed);
+        let stream_end = request(&fixture.backend, 5, Some("active"), true, None);
+        assert!(matches!(
+            fixture.run(&stream_end, None),
+            ProviderResponse::Cleanup { .. }
+        ));
+        assert!(fixture.policies().is_empty());
     }
 
     #[test]

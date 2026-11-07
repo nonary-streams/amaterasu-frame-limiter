@@ -331,6 +331,30 @@ impl Drop for ProtonWorker {
 }
 
 #[cfg(test)]
+pub(crate) fn apply_hook_for_test(runtime_root: &Path) -> Value {
+    const APPLY: &str = r#"
+import json, sys, types
+module = types.ModuleType('amaterasu_limiter')
+exec(compile(sys.argv[1], '<amaterasu:limiter-hook-test>', 'exec'), module.__dict__)
+environment = {'XDG_RUNTIME_DIR': sys.argv[2], 'SteamAppId': '42'}
+applied = module.apply({'g_session': types.SimpleNamespace(env=environment)})
+print(json.dumps({'applied': applied, 'environment': environment}))
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-c", APPLY])
+        .arg(LIMITER)
+        .arg(runtime_root)
+        .output()
+        .expect("start isolated Proton hook test");
+    assert!(
+        output.status.success(),
+        "isolated Proton hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("isolated Proton hook returns JSON")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
