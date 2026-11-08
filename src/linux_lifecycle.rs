@@ -88,10 +88,22 @@ impl Backend {
             }
             backend.steam_roots = roots;
         }
-        if backend.runtime_root.is_some() {
-            backend.initialize()?;
-        }
+        backend.initialize_configured_state()?;
         Ok(backend)
+    }
+
+    fn initialize_configured_state(&mut self) -> Result<(), &'static str> {
+        if self.runtime_root.is_some() {
+            return self.initialize();
+        }
+        let Some(root) = &self.journal_root else {
+            return Ok(());
+        };
+        match std::fs::symlink_metadata(root.join("amaterasu/frame-limiter/lifecycle.json")) {
+            Ok(_) => self.initialize(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("journal_unavailable"),
+        }
     }
 
     pub(crate) fn plan(
@@ -1173,6 +1185,39 @@ mod tests {
         ));
         assert!(fixture.backend.worker.is_none());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn missing_runtime_directory_does_not_hide_persistent_policy_recovery() {
+        let mut fixture = Fixture::new();
+        fixture.backend.state.pending_policies = Some(BTreeMap::new());
+        fixture.backend.checkpoint().unwrap();
+        let root = fixture.root.clone();
+        // Release only the journal lock; no worker or native policy was started.
+        fixture.backend = Backend::new(None, vec![]);
+        fixture.backend.journal_root = Some(root);
+        fixture.backend.initialize_configured_state().unwrap();
+        assert!(fixture.backend.is_recovering());
+        fixture
+            .backend
+            .prepare_shutdown(Instant::now() + Duration::from_secs(5));
+        assert_eq!(
+            fixture.backend.quiesce(),
+            Err("runtime_directory_unavailable")
+        );
+        assert!(fixture.backend.state.pending_policies.is_some());
+    }
+
+    #[test]
+    fn missing_runtime_without_a_persistent_journal_can_quiesce() {
+        let fixture = Fixture::new();
+        let empty = fixture.root.join("no-previous-state");
+        let mut backend = Backend::new(None, vec![]);
+        backend.journal_root = Some(empty.clone());
+        backend.initialize_configured_state().unwrap();
+        assert!(backend.journal.is_none());
+        assert_eq!(backend.quiesce(), Ok(true));
+        assert!(!empty.exists());
     }
 
     fn request(
