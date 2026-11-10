@@ -243,6 +243,29 @@ impl State {
                 self.ownership.remember_retired_target(&receipt.target)?;
             }
             let response = match &receipt.response {
+                Some(ProviderResponse::Rejected { .. }) if !receipt.is_cleanup() => {
+                    // Verified worker retirement covers even callbacks rejected
+                    // before a policy slot was created. Return scoped cleanup
+                    // proof for the original receipt, never a replayed prepare.
+                    let ProviderResponse::Prepared { obligations, .. } = &receipt.expected_response
+                    else {
+                        return Err("invalid_preparation_receipt");
+                    };
+                    ProviderResponse::Cleanup {
+                        outcomes: obligations
+                            .iter()
+                            .map(
+                                |obligation| amaterasu_module_sdk::extension_api::CleanupOutcome {
+                                    obligation_id: obligation.obligation_id.clone(),
+                                    state:
+                                        amaterasu_module_sdk::extension_api::CleanupState::Released,
+                                    reason: None,
+                                },
+                            )
+                            .collect(),
+                        outputs: vec![],
+                    }
+                }
                 Some(ProviderResponse::Rejected { .. })
                 | Some(ProviderResponse::Cleanup { .. }) => receipt.response.clone().unwrap(),
                 _ if receipt.is_cleanup() && known_cleanup.contains(id) => {
@@ -756,5 +779,41 @@ mod tests {
                 .values()
                 .all(|receipt| matches!(receipt.response, Some(ProviderResponse::Cleanup { .. })))
         );
+    }
+    #[test]
+    fn rejected_preparation_is_cleanup_proof_only_after_verified_worker_retirement() {
+        let mut state = State::new().unwrap();
+        let id = receipt_key("transition", "operation", 1);
+        state.receipts.insert(
+            id.clone(),
+            Receipt {
+                target: LifecycleTarget::Session {
+                    host_epoch: "epoch".into(),
+                    session_id: "session".into(),
+                    generation: 1,
+                },
+                transition_id: "transition".into(),
+                operation_id: "operation".into(),
+                provider_sequence: 1,
+                fingerprint: "0".repeat(64),
+                expected_response: ProviderResponse::Prepared {
+                    candidate: None,
+                    obligations: vec![],
+                    outputs: vec![],
+                },
+                response: Some(ProviderResponse::Rejected {
+                    reason: "session_capacity_exhausted".into(),
+                }),
+            },
+        );
+        assert!(matches!(
+            state.receipts[&id].response,
+            Some(ProviderResponse::Rejected { .. })
+        ));
+        state.retire_after_worker_restart().unwrap();
+        assert!(
+            matches!(&state.receipts[&id].response, Some(ProviderResponse::Cleanup {outcomes,outputs}) if outcomes.is_empty() && outputs.is_empty())
+        );
+        state.validate().unwrap();
     }
 }

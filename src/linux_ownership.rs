@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const MAX_SESSIONS: usize = 32;
+const MAX_SESSION_HISTORY: usize = MAX_SESSIONS + MAX_COMPLETED_SESSIONS;
 const MAX_RETIRED_TARGETS: usize = 256;
 const MAX_COMPLETED_SESSIONS: usize = 256;
 
@@ -139,6 +140,27 @@ fn target_key(target: &LifecycleTarget) -> Result<String, &'static str> {
 }
 
 impl Ownership {
+    // Worker retirement removes native bindings but keeps exact target history
+    // for late cleanup. That history must not occupy live policy slots.
+    fn check_capacity(&self, session: &str, preparing: bool) -> Result<(), &'static str> {
+        let existing = self.sessions.get(session);
+        if existing.is_none() && self.sessions.len() >= MAX_SESSION_HISTORY {
+            return Err("retirement_capacity_exhausted");
+        }
+        if preparing
+            && existing.is_none_or(|entry| !entry.has_bindings())
+            && self
+                .sessions
+                .values()
+                .filter(|entry| entry.has_bindings())
+                .count()
+                >= MAX_SESSIONS
+        {
+            return Err("session_capacity_exhausted");
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_root(&self, session: &str) -> bool {
         self.sessions
             .get(session)
@@ -153,9 +175,7 @@ impl Ownership {
         if self.completed.contains_key(&key) {
             return Ok(());
         }
-        if !self.sessions.contains_key(&key) && self.sessions.len() >= MAX_SESSIONS {
-            return Err("session_capacity_exhausted");
-        }
+        self.check_capacity(&key, false)?;
         let target = target_key(target)?;
         let entry = self.sessions.entry(key).or_default();
         if !entry.retired.contains(&target) && entry.tracked_targets() >= MAX_RETIRED_TARGETS {
@@ -166,7 +186,13 @@ impl Ownership {
     }
 
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        if self.sessions.len() > MAX_SESSIONS
+        if self.sessions.len() > MAX_SESSION_HISTORY
+            || self
+                .sessions
+                .values()
+                .filter(|entry| entry.has_bindings())
+                .count()
+                > MAX_SESSIONS
             || self.completed.len() > MAX_COMPLETED_SESSIONS
             || self.completed.len() != self.completion_order.len()
             || self.completion_order.iter().collect::<BTreeSet<_>>().len()
@@ -311,9 +337,7 @@ impl Ownership {
             return Err("retired_session");
         }
         let existing = self.sessions.get(&session);
-        if existing.is_none() && self.sessions.len() >= MAX_SESSIONS {
-            return Err("session_capacity_exhausted");
-        }
+        self.check_capacity(&session, true)?;
         if existing.is_some_and(|entry| entry.retiring_root.is_some()) {
             return Err("retired_session");
         }
@@ -420,9 +444,7 @@ impl Ownership {
             .generation
             .checked_add(1)
             .ok_or("ownership_generation_exhausted")?;
-        if existing.is_none() && self.sessions.len() >= MAX_SESSIONS {
-            return Err("session_capacity_exhausted");
-        }
+        self.check_capacity(&change.session, change.new_revision.is_some())?;
         let entry = self.sessions.entry(change.session).or_default();
         entry.migrate_legacy_root()?;
         let slot = match change.target {
@@ -792,5 +814,50 @@ mod tests {
         let release_stream = owner.release(&stream("first")).unwrap().unwrap();
         assert_eq!(release_stream.expected_revision, stream_revision);
         owner.commit(release_stream).unwrap();
+    }
+    #[test]
+    fn retired_worker_history_does_not_consume_live_policy_capacity() {
+        let mut owner = Ownership::default();
+        let mut targets = Vec::new();
+        for index in 0..MAX_SESSIONS + 1 {
+            let target = LifecycleTarget::Session {
+                host_epoch: "epoch".into(),
+                session_id: format!("session-{index}"),
+                generation: 1,
+            };
+            let change = owner.prepare(&target, "prepare").unwrap();
+            owner.commit(change).unwrap();
+            owner.retire_after_worker_restart().unwrap();
+            targets.push(target);
+        }
+        let mut owner: Ownership =
+            serde_json::from_value(serde_json::to_value(owner).unwrap()).unwrap();
+        owner.validate().unwrap();
+        for target in targets {
+            assert!(owner.release(&target).unwrap().is_none());
+            owner.finish_session(&target).unwrap();
+        }
+        assert!(owner.sessions.is_empty());
+    }
+
+    #[test]
+    fn retained_history_does_not_expand_live_policy_limit() {
+        let mut owner = Ownership::default();
+        for index in 0..MAX_SESSIONS + 1 {
+            let target = LifecycleTarget::Session {
+                host_epoch: "epoch".into(),
+                session_id: format!("session-{index}"),
+                generation: 1,
+            };
+            if index == MAX_SESSIONS {
+                assert_eq!(
+                    owner.prepare(&target, "prepare"),
+                    Err("session_capacity_exhausted")
+                );
+            } else {
+                let change = owner.prepare(&target, "prepare").unwrap();
+                owner.commit(change).unwrap();
+            }
+        }
     }
 }
