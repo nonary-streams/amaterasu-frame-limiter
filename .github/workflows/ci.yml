@@ -1,0 +1,52 @@
+name: Module
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read the pinned SDK revision
+        id: sdk
+        shell: bash
+        run: |
+          revision=$(cat sdk-revision)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: nonary-streams/amaterasu-sdk
+          ref: ${{ steps.sdk.outputs.revision }}
+          path: .sdk
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libpulse-dev pkg-config
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: python scripts/build-native.py .sdk --fmt
+      - run: python scripts/build-native.py .sdk --test
+      - run: python scripts/build-native.py .sdk --clippy
+      - run: python scripts/build-native.py .sdk --release

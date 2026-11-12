@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "family": "frame-limiter",
+  "repository": "https://github.com/nonary-streams/amaterasu-frame-limiter",
+  "mount": "modules/frame-limiter",
+  "components": [
+    {
+      "id": "amaterasu.frame-limiter",
+      "package": "amaterasu-frame-limiter",
+      "path": ".",
+      "name": "Frame limiter",
+      "summary": "Caps a game's frame rate to match the stream."
+    }
+  ]
+}

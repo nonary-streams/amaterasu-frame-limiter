@@ -1,0 +1,97 @@
+name: Release
+
+# Pushing a tag such as v0.2.0 builds this module for each shipped platform,
+# records where the libraries were built, and publishes them as a release.
+# The tag must equal the version in the module's Cargo manifests.
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check the tag against the module version
+        shell: bash
+        run: python scripts/release-version.py "${GITHUB_REF_NAME#v}"
+      - name: Read the pinned SDK revision
+        id: sdk
+        shell: bash
+        run: |
+          revision=$(cat sdk-revision)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          repository: nonary-streams/amaterasu-sdk
+          ref: ${{ steps.sdk.outputs.revision }}
+          path: .sdk
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev libpulse-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - run: python scripts/build-native.py .sdk --test --release
+      - run: python scripts/build-native.py .sdk --release --artifacts dist/${{ matrix.target }}
+      - name: Record what was built
+        shell: bash
+        run: |
+          cp metadata/module.json sdk-revision LICENSE dist/${{ matrix.target }}/
+          cd dist/${{ matrix.target }}
+          sha256sum * > SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/${{ matrix.target }}/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="${GITHUB_REPOSITORY#*/}-${GITHUB_REF_NAME#v}"
+          for target in dist/*/; do
+            target="$(basename "$target")"
+            tar -C "dist/$target" -czf "$name-$target.tar.gz" .
+          done
+          sha256sum "$name"-*.tar.gz > "$name-SHA256SUMS"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            "$name"-*.tar.gz "$name-SHA256SUMS"

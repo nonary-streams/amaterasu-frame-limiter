@@ -3,6 +3,8 @@ name = "amaterasu-frame-limiter"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/nonary-streams/amaterasu-frame-limiter"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

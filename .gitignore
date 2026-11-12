@@ -3,3 +3,5 @@
 /ui/build
 __pycache__/
 *.pyc
+/.sdk/
+/dist/
