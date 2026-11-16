@@ -188,6 +188,22 @@ impl Bridge {
         Ok(bridge)
     }
 
+    /// The frame limiter refused the stream's policy; the coordinator ends
+    /// or skips the transition in reaction.
+    #[track_caller]
+    fn report_rejection(&mut self, request: &ProviderRequest, phase: &str, reason: &str) {
+        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+        self.stream_issues.push(
+            StreamIssue::critical(
+                request.operation_id.clone(),
+                LifecycleLayer::FrameLimiter,
+                phase,
+                "frame_limiter_rejected",
+            )
+            .because(reason),
+        );
+    }
+
     /// The stream continues without a frame limit. Tell the launch owner.
     #[track_caller]
     fn demote_to_no_op(&mut self, request: &ProviderRequest, phase: &str, reason: &str) {
@@ -374,6 +390,7 @@ impl Bridge {
             };
         }
         let mut completion = None;
+        let mut context_lost = false;
         match &mut pending.stage {
             Stage::Submit => {
                 let payload = serde_json::to_value(extension_api::ProviderContextRequest {
@@ -403,6 +420,7 @@ impl Bridge {
                         if !self.shutdown.started() {
                             completion =
                                 Some(json!({"status":"rejected","reason":"context_unavailable"}));
+                            context_lost = true;
                         }
                     }
                     _ => (), // Retry the same read identity after uncertain admission.
@@ -412,7 +430,8 @@ impl Bridge {
                 Ok(Response::Pending) => (),
                 Ok(Response::Result { payload }) => pending.stage = Stage::Release(*id, payload),
                 Ok(Response::Error { code, .. }) if code == "not_found" => {
-                    completion = Some(json!({"status":"rejected","reason":"context_unavailable"}))
+                    completion = Some(json!({"status":"rejected","reason":"context_unavailable"}));
+                    context_lost = true;
                 }
                 _ => (),
             },
@@ -472,6 +491,11 @@ impl Bridge {
             },
         }
         if let Some(payload) = completion {
+            if context_lost {
+                // Decisions report their own refusals; this one was made
+                // before a decision could run.
+                self.report_rejection(&pending.request, "read_context", "context_unavailable");
+            }
             if !pending.abandoned {
                 match runtime.send(Command::Complete {
                     request: pending.inbound,
@@ -494,7 +518,23 @@ impl Bridge {
         self.evaluate_with_budget(request, payload, request.remaining_ms)
     }
 
+    /// Decide a provider request. A refusal, whichever check made it, is
+    /// reported as this module's own failure.
     fn evaluate_with_budget(
+        &mut self,
+        request: &ProviderRequest,
+        payload: Value,
+        remaining_ms: u64,
+    ) -> Value {
+        let reply = self.decide_with_budget(request, payload, remaining_ms);
+        if reply["status"] == "rejected" {
+            let reason = reply["reason"].as_str().unwrap_or("rejected").to_owned();
+            self.report_rejection(request, &operation_phase(request), &reason);
+        }
+        reply
+    }
+
+    fn decide_with_budget(
         &mut self,
         request: &ProviderRequest,
         payload: Value,
@@ -752,6 +792,14 @@ fn unavailable_backend_policy(settings: &Value) -> Result<Option<Value>, &'stati
     }
 }
 
+/// `resource_plan`, `lifecycle_callback`, ... for the issue's phase.
+fn operation_phase(request: &ProviderRequest) -> String {
+    serde_json::to_value(&request.operation)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "provider_request".to_owned())
+}
+
 fn response_value(
     request: &ProviderRequest,
     response: Result<extension_api::ProviderResponse, &'static str>,
@@ -885,7 +933,19 @@ mod tests {
             bridge.evaluate(&enabled, forged)["reason"],
             "context_mismatch"
         );
+        let reported: Vec<_> = bridge.stream_issues.drain().collect();
+        let [StreamReport::Issue(issue)] = reported.as_slice() else {
+            panic!("one refusal is reported: {reported:?}");
+        };
+        assert_eq!(issue.operation, enabled.operation_id);
+        assert_eq!(issue.layer, LifecycleLayer::FrameLimiter);
+        assert_eq!(issue.code, "frame_limiter_rejected");
+        assert_eq!(issue.reason, "context_mismatch");
+        assert!(issue.is_critical() && issue.is_origin());
+        assert!(issue.site.contains("lifecycle.rs:"), "{}", issue.site);
     }
+
+    use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamReport};
 
     #[test]
     fn unavailable_policy_demotes_to_noop_plan() {
