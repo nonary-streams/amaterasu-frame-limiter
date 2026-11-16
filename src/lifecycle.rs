@@ -154,6 +154,8 @@ pub(crate) struct Bridge {
     selected: Selection,
     pending: VecDeque<Pending>,
     shutdown: crate::shutdown::Shutdown,
+    /// Fallbacks the launch owner should see, published from `advance`.
+    stream_issues: amaterasu_module_sdk::stream_lifecycle::StreamIssueOutbox,
     #[cfg(target_os = "linux")]
     backend: crate::linux_lifecycle::Backend,
     #[cfg(windows)]
@@ -186,11 +188,31 @@ impl Bridge {
         Ok(bridge)
     }
 
+    /// The stream continues without a frame limit. Tell the launch owner.
+    #[track_caller]
+    fn demote_to_no_op(&mut self, request: &ProviderRequest, phase: &str, reason: &str) {
+        use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamIssue};
+        let issue = StreamIssue::demoted(
+            request.operation_id.clone(),
+            LifecycleLayer::FrameLimiter,
+            phase,
+            "frame_limiter_unavailable",
+            "noop_frame_limiter",
+        )
+        .because(reason);
+        eprintln!(
+            "frame limiter demoted to no-op operation={} phase={phase} reason={reason}",
+            request.operation_id
+        );
+        self.stream_issues.push(issue);
+    }
+
     pub(crate) fn new(selected: Selection) -> Self {
         Self {
             selected,
             pending: VecDeque::new(),
             shutdown: Default::default(),
+            stream_issues: Default::default(),
             #[cfg(target_os = "linux")]
             backend: crate::linux_lifecycle::Backend::from_environment(),
             #[cfg(windows)]
@@ -318,6 +340,11 @@ impl Bridge {
     }
 
     pub(crate) fn advance(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
+        if !self.stream_issues.is_empty()
+            && let Err(error) = self.stream_issues.flush(runtime)
+        {
+            eprintln!("frame limiter stream issue report failed error={error}");
+        }
         #[cfg(target_os = "linux")]
         self.backend.advance();
         let Some(mut pending) = self.pending.pop_front() else {
@@ -639,6 +666,21 @@ impl Bridge {
             &serde_json::to_value(&request.settings).unwrap_or(Value::Null),
         );
         match decision {
+            Err(reason)
+                if matches!(
+                    reason,
+                    "vsync_control_unavailable"
+                        | "mangohud_unavailable"
+                        | "client_context_unavailable"
+                        | "provider_unavailable"
+                        | "stream_rate_unavailable"
+                        | "platform_backend_unavailable"
+                        | "invalid_rate"
+                ) =>
+            {
+                self.demote_to_no_op(request, "policy_resolve", reason);
+                no_op_response(request)
+            }
             Err(reason) => json!({"status":"rejected","reason":reason}),
             Ok(Some(policy)) => {
                 #[cfg(target_os = "linux")]
@@ -676,6 +718,18 @@ impl Bridge {
                     let _ = policy;
                     Err("platform_backend_unavailable")
                 };
+                if request.operation == ProviderOperation::ResourcePlan
+                    && let Err(reason) = response
+                    && matches!(
+                        reason,
+                        "backend_not_configured"
+                            | "platform_backend_unavailable"
+                            | "worker_not_ready"
+                    )
+                {
+                    self.demote_to_no_op(request, "resource_plan", reason);
+                    return no_op_response(request);
+                }
                 response_value(request, response)
             }
             Ok(None) => no_op_response(request),
@@ -831,6 +885,23 @@ mod tests {
             bridge.evaluate(&enabled, forged)["reason"],
             "context_mismatch"
         );
+    }
+
+    #[test]
+    fn unavailable_policy_demotes_to_noop_plan() {
+        let mut bridge = Bridge::new(Selection {
+            principal: "coordinator".into(),
+            service: "lifecycle/1".into(),
+        });
+        let mut missing_context = request("proton");
+        missing_context
+            .settings
+            .insert("frame_limiter_enable".into(), json!(true));
+        let mut ctx = context(&missing_context);
+        ctx["context"]["client"] = json!(null);
+        let result = bridge.evaluate(&missing_context, ctx);
+        assert_eq!(result["status"], "planned");
+        assert_eq!(result["plan"]["obligations"], json!([]));
     }
 
     #[cfg(target_os = "linux")]
