@@ -903,8 +903,16 @@ mod tests {
             state["policies"].as_array().unwrap().clone()
         }
 
+        fn crash_worker(&mut self) {
+            if let Some(mut worker) = self.backend.worker.take() {
+                // EOF is graceful and can clear active.json. Simulate process
+                // loss and wait for exit before restarting or changing policy.
+                worker.crash_for_test();
+            }
+        }
+
         fn restart(&mut self) {
-            self.backend.worker = None;
+            self.crash_worker();
             self.backend = Backend::new(None, vec![]);
             self.backend = Backend::configured(&json!({
                 "proton_runtime_directory":self.root,
@@ -1148,7 +1156,7 @@ mod tests {
             let policy = policy(60000);
             let prepare = request(&fixture.backend, 1, None, false, Some(&policy));
             fixture.run(&prepare, Some(policy));
-            fixture.backend.worker = None;
+            fixture.crash_worker();
             let path = fixture.root.join("amaterasu/frame-limiter/active.json");
             let mut foreign: Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

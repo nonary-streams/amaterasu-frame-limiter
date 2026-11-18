@@ -128,6 +128,8 @@ unsafe extern "system" {
 }
 
 fn no_follow(options: &mut OpenOptions) {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = options;
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;

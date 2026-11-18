@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16,11 +22,11 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-abi"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "amaterasu-configuration-schema"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -28,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-contracts"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-extension-api",
  "serde",
@@ -37,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-data-plane"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-abi",
  "serde",
@@ -45,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-extension-api"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-configuration-schema",
  "serde",
@@ -69,12 +75,13 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-gamestream"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "aes",
  "amaterasu-abi",
  "amaterasu-contracts",
  "amaterasu-media",
+ "amaterasu-module-sdk",
  "amaterasu-timing-metrics",
  "cbc",
  "ring",
@@ -84,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-input-companion"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-storage",
  "libc",
@@ -95,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-input-policy"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -103,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-media"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-abi",
  "libc",
@@ -114,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-module-sdk"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
@@ -138,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-module-testkit"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-contracts",
  "amaterasu-module-sdk",
@@ -148,14 +155,14 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-network-api"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-abi",
 ]
 
 [[package]]
 name = "amaterasu-network-sockets"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-network-api",
@@ -167,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-process-api"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-abi",
  "serde",
@@ -175,8 +182,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-rtx-runtime"
+version = "0.1.2"
+dependencies = [
+ "amaterasu-abi",
+ "amaterasu-module-sdk",
+ "amaterasu-network-sockets",
+ "flate2",
+ "getrandom 0.3.4",
+ "libc",
+ "sha2",
+ "ureq",
+ "zip",
+]
+
+[[package]]
 name = "amaterasu-runtime"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
@@ -189,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-storage"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-timing-metrics",
  "getrandom 0.3.4",
@@ -199,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-timing-metrics"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "libc",
  "serde",
@@ -208,10 +230,19 @@ dependencies = [
 
 [[package]]
 name = "amaterasu-windows-capture-geometry"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amaterasu-media",
  "windows",
+]
+
+[[package]]
+name = "arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
+dependencies = [
+ "derive_arbitrary",
 ]
 
 [[package]]
@@ -327,6 +358,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -334,6 +380,17 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "derive_arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -345,6 +402,12 @@ dependencies = [
  "block-buffer",
  "crypto-common",
 ]
+
+[[package]]
+name = "equivalent"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "example-service-guard"
@@ -361,6 +424,17 @@ name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+
+[[package]]
+name = "flate2"
+version = "1.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
+ "zlib-rs",
+]
 
 [[package]]
 name = "generic-array"
@@ -396,6 +470,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -410,6 +490,16 @@ name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "indexmap"
+version = "2.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
+dependencies = [
+ "equivalent",
+ "hashbrown",
+]
 
 [[package]]
 name = "inout"
@@ -503,6 +593,16 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
 
 [[package]]
 name = "once_cell"
@@ -749,6 +849,12 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "simd-adler32"
+version = "0.3.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simd_cesu8"
@@ -1138,6 +1244,26 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+
+[[package]]
+name = "zip"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1dcb24d0152526ae49b9b96c1dcf71850ca1e0b882e4e28ed898a93c41334744"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "crossbeam-utils",
+ "flate2",
+ "indexmap",
+ "memchr",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

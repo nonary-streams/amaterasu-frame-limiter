@@ -945,8 +945,10 @@ mod tests {
         assert!(issue.site.contains("lifecycle.rs:"), "{}", issue.site);
     }
 
+    #[cfg(target_os = "linux")]
     use amaterasu_module_sdk::stream_lifecycle::{LifecycleLayer, StreamReport};
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unavailable_policy_demotes_to_noop_plan() {
         let mut bridge = Bridge::new(Selection {
