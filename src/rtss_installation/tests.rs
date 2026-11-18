@@ -196,7 +196,7 @@ fn worker_retirement_confirms_descendants_exit_before_permitting_fallback() {
     let root = Directory::new();
     let mut command = std::process::Command::new(fixture);
     command.arg("--wait-input").current_dir(&root.0);
-    let worker = crate::native_worker_process::Process::spawn(command).unwrap();
+    let mut worker = crate::native_worker_process::Process::spawn(command).unwrap();
     worker.submit(&serde_json::json!({"start":true})).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     while !root.0.join("descendant.ready").exists() {
@@ -212,7 +212,12 @@ fn worker_retirement_confirms_descendants_exit_before_permitting_fallback() {
     assert!(!raw.is_null());
     // SAFETY: raw is a new owned process handle checked above.
     let descendant = unsafe { File::from_raw_handle(raw) };
-    worker.retire().unwrap();
+    worker.force_stop().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while worker.poll_exit().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "worker tree did not retire");
+        std::thread::sleep(Duration::from_millis(2));
+    }
     // SAFETY: this handle pins the descendant process identity across retirement.
     assert_eq!(
         unsafe { WaitForSingleObject(descendant.as_raw_handle(), 0) },

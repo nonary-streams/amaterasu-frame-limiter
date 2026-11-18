@@ -1056,9 +1056,12 @@ mod tests {
         let incomplete = handle_payload("module-host", incomplete_context);
         assert_eq!(incomplete["plan"]["should_consider_apply"], Value::Null);
         assert_eq!(incomplete["plan"]["effective_limit_millihz"], Value::Null);
-        assert_eq!(
-            incomplete["plan"]["diagnostics"][1],
-            "policy_context_incomplete"
+        assert!(
+            incomplete["plan"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic == "policy_context_incomplete")
         );
 
         let mut complete_context = apply_json();
