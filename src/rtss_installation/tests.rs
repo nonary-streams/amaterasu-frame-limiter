@@ -43,12 +43,19 @@ fn installation_must_be_a_strict_descendant_of_a_trusted_root() {
 #[test]
 fn ordinary_user_writable_installation_is_rejected() {
     let root = Directory::new();
-    let installation = root.0.join("RTSS");
+    // The real known-folder provider supplies canonical trusted roots. Windows
+    // runner temp paths may use a short-name spelling before canonicalization.
+    let trusted_root = std::fs::canonicalize(&root.0).unwrap();
+    let installation = trusted_root.join("RTSS");
     std::fs::create_dir(&installation).unwrap();
-    assert!(matches!(
-        Installation::open_below(&installation, std::slice::from_ref(&root.0)),
-        Err(ProviderError::Unavailable("rtss_code_mutable_by_user"))
-    ));
+    let failure = Installation::open_below(&installation, &[trusted_root]).err();
+    assert!(
+        matches!(
+            failure,
+            Some(ProviderError::Unavailable("rtss_code_mutable_by_user"))
+        ),
+        "expected the writable-directory guard, got {failure:?}"
+    );
 }
 
 #[test]
