@@ -120,6 +120,7 @@ impl<P: FrameLimitProvider, N: DriverSettings> Backend<P, N> {
             .then_some(root.policy))
     }
 
+    #[cfg(test)]
     pub(super) fn root_owns(&self, root: &Root, target: &LifecycleTarget) -> bool {
         let Ok((_, id)) = target_identity(target) else {
             return false;
