@@ -99,6 +99,12 @@
             draft = { ...state.values };
             baseline = { ...draft };
             const scope = settings.scope.kind;
+            const everyday = new Set(['frame_limiter_enable', 'frame_limiter_fps_limit', 'frame_limiter_auto_virtual_framegen']);
+            const more = document.createElement('details');
+            const summary = document.createElement('summary');
+            summary.textContent = 'More frame limiting settings';
+            more.append(summary);
+            let hasMore = false;
             for (const option of descriptor.options.filter(option => option.allowed_scopes.includes(scope))) {
                 const id = option.id, definition = option.definition;
                 if (controls.has(id) || !Object.hasOwn(state.effective, id))
@@ -132,9 +138,15 @@
                 row.append(control.element);
                 if (inherit)
                     row.append(inherit.element);
-                fields.append(row);
+                if (scope === 'host' && !everyday.has(id)) {
+                    more.append(row);
+                    hasMore = true;
+                } else {
+                    fields.append(row);
+                }
                 controls.set(id, { control, inherit });
             }
+            if (hasMore) fields.append(more);
             updateDraftState();
             status.textContent = settings.canWrite ? 'Frame limiting settings are up to date.' : 'Frame limiting settings are read-only.';
         }).catch(error => { if (!disposed)
